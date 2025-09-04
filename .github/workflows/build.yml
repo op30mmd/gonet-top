@@ -1,0 +1,29 @@
+name: Build gonet-top
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.24.3'
+
+    - name: Build
+      run: go build -o gonet-top.exe .
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: gonet-top-windows-amd64
+        path: gonet-top.exe
