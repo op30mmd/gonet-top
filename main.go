@@ -15,6 +15,7 @@ import (
 	"github.com/0xrawsec/golang-etw/etw"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mitchellh/go-ps"
 )
 
 // --- ETW and Data Structures ---
@@ -39,11 +40,17 @@ var statsMap = struct {
 	m map[uint32]*ProcessNetStats
 }{m: make(map[uint32]*ProcessNetStats)}
 
+var pidNameCache = struct {
+	sync.RWMutex
+	m map[uint32]string
+}{m: make(map[uint32]string)}
+
 // --- Bubble Tea Model ---
 
 // ProcessDisplayInfo holds the calculated and formatted data for one process.
 type ProcessDisplayInfo struct {
 	PID       uint32
+	ProcessName string
 	SendSpeed string
 	RecvSpeed string
 }
@@ -61,6 +68,7 @@ func initialModel() model {
 
 func (m model) Init() tea.Cmd {
 	go startEtwConsumer()
+	go startProcessNameWatcher()
 	return tick()
 }
 
@@ -92,7 +100,7 @@ func (m model) View() string {
 	headerRow := lipgloss.JoinHorizontal(
 		lipgloss.Left,
 		headerStyle.Copy().Width(10).Render(headers[0]),
-		headerStyle.Copy().Width(30).Render(headers[1]), // Name is blank for now
+		headerStyle.Copy().Width(30).Render(headers[1]),
 		headerStyle.Copy().Width(15).Render(headers[2]),
 		headerStyle.Copy().Width(15).Render(headers[3]),
 	)
@@ -104,7 +112,7 @@ func (m model) View() string {
 		row := lipgloss.JoinHorizontal(
 			lipgloss.Left,
 			cellStyle.Copy().Width(10).Render(pidStr),
-			cellStyle.Copy().Width(30).Render(""), // Name is blank for now
+			cellStyle.Copy().Width(30).Render(p.ProcessName),
 			cellStyle.Copy().Width(15).Render(p.SendSpeed),
 			cellStyle.Copy().Width(15).Render(p.RecvSpeed),
 		)
@@ -125,8 +133,6 @@ func tick() tea.Cmd {
 
 func calculateRates() statsUpdatedMsg {
 	statsMap.Lock()
-
-	// Create a temporary copy of the map to work with.
 	tempStats := make(map[uint32]*ProcessNetStats, len(statsMap.m))
 	for pid, stats := range statsMap.m {
 		tempStats[pid] = &ProcessNetStats{
@@ -134,17 +140,23 @@ func calculateRates() statsUpdatedMsg {
 			SentBytes: stats.SentBytes,
 			RecvBytes: stats.RecvBytes,
 		}
-		// Reset the original map for the next interval.
 		stats.SentBytes = 0
 		stats.RecvBytes = 0
 	}
 	statsMap.Unlock()
 
-	// Calculate and format rates from the temporary copy.
+	pidNameCache.RLock()
+	defer pidNameCache.RUnlock()
+
 	var displayInfos []ProcessDisplayInfo
-	for _, stats := range tempStats {
+	for pid, stats := range tempStats {
+		name, ok := pidNameCache.m[pid]
+		if !ok {
+			name = "N/A"
+		}
 		displayInfos = append(displayInfos, ProcessDisplayInfo{
 			PID:       stats.PID,
+			ProcessName: name,
 			SendSpeed: formatSpeed(stats.SentBytes),
 			RecvSpeed: formatSpeed(stats.RecvBytes),
 		})
@@ -166,6 +178,40 @@ func formatSpeed(bytes uint64) string {
 	return fmt.Sprintf("%.2f %cB/s",
 		float64(bytes)/float64(div), "KMGTPE"[exp])
 }
+
+// --- Process Name Discovery ---
+
+func getProcessNames() (map[uint32]string, error) {
+	processes, err := ps.Processes()
+	if err != nil {
+		return nil, err
+	}
+
+	pidMap := make(map[uint32]string, len(processes))
+	for _, p := range processes {
+		pidMap[uint32(p.Pid())] = p.Executable()
+	}
+	return pidMap, nil
+}
+
+func startProcessNameWatcher() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+		names, err := getProcessNames()
+		if err != nil {
+			// Log the error but continue; we don't want to crash the app.
+			log.Printf("Error getting process names: %v", err)
+			continue
+		}
+		pidNameCache.Lock()
+		pidNameCache.m = names
+		pidNameCache.Unlock()
+	}
+}
+
 
 // --- Main and ETW Logic ---
 
