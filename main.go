@@ -133,32 +133,26 @@ func tick() tea.Cmd {
 
 func calculateRates() statsUpdatedMsg {
 	statsMap.Lock()
-	tempStats := make(map[uint32]*ProcessNetStats, len(statsMap.m))
-	for pid, stats := range statsMap.m {
-		tempStats[pid] = &ProcessNetStats{
-			PID:       stats.PID,
-			SentBytes: stats.SentBytes,
-			RecvBytes: stats.RecvBytes,
-		}
-		stats.SentBytes = 0
-		stats.RecvBytes = 0
-	}
+	// Atomically swap the map with a new empty one.
+	currentStats := statsMap.m
+	statsMap.m = make(map[uint32]*ProcessNetStats)
 	statsMap.Unlock()
 
+	// Now, we can process the captured `currentStats` map without locks.
 	pidNameCache.RLock()
 	defer pidNameCache.RUnlock()
 
 	var displayInfos []ProcessDisplayInfo
-	for pid, stats := range tempStats {
+	for pid, stats := range currentStats {
 		name, ok := pidNameCache.m[pid]
 		if !ok {
 			name = "N/A"
 		}
 		displayInfos = append(displayInfos, ProcessDisplayInfo{
-			PID:       stats.PID,
+			PID:         stats.PID,
 			ProcessName: name,
-			SendSpeed: formatSpeed(stats.SentBytes),
-			RecvSpeed: formatSpeed(stats.RecvBytes),
+			SendSpeed:   formatSpeed(stats.SentBytes),
+			RecvSpeed:   formatSpeed(stats.RecvBytes),
 		})
 	}
 
