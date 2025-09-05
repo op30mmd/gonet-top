@@ -2,20 +2,13 @@ package main
 
 import (
 	"fmt"
-	"os"
+	"time"
 )
 
-// isAdmin checks for administrator privileges by attempting to open a handle
-// to the physical drive, which is only accessible to administrators.
-func isAdmin() bool {
-	_, err := os.Open("\\\\.\\PHYSICALDRIVE0")
-	return err == nil
-}
-
 func main() {
-	// This is a minimal diagnostic test.
-	// It checks for admin privileges and prints the result to standard output.
-	// This will help determine the behavior of the isAdmin() function in the CI environment.
-	isAdminResult := isAdmin()
-	fmt.Printf("isAdmin: %v\n", isAdminResult)
+	// This is the simplest possible diagnostic test.
+	// It prints "Hello, World!" and waits, to confirm that a basic Go
+	// executable can run and produce output in the CI environment.
+	fmt.Println("Hello, World!")
+	time.Sleep(5 * time.Second)
 }
