@@ -24,18 +24,21 @@ jobs:
 
     - name: Run and Test Application
       run: |
-        # Start the application in the background, redirecting all output to a log file
-        Start-Process -FilePath "./gonet-top.exe" -RedirectStandardOutput "output.log" -RedirectStandardError "output.log"
+        # Start the application as a background job
+        Start-Job -ScriptBlock { ./gonet-top.exe *>&1 > "output.log" }
 
-        # Wait for 10 seconds to let the app run and collect data
+        # Wait for 10 seconds to let the app run
         Start-Sleep -Seconds 10
 
-        # Stop the process forcefully
-        Get-Process "gonet-top" | Stop-Process -Force
+        # Stop the process if it's still running
+        $process = Get-Process "gonet-top" -ErrorAction SilentlyContinue
+        if ($process) {
+            Stop-Process -Id $process.Id -Force
+        }
 
         # Display the output from the log file
         echo "--- Application Output Log ---"
-        cat output.log
+        Get-Content output.log -ErrorAction SilentlyContinue
         echo "--- End Application Output Log ---"
       shell: powershell
 
