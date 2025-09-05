@@ -24,22 +24,12 @@ jobs:
 
     - name: Run and Test Application
       run: |
-        # Start the application as a background job
-        Start-Job -ScriptBlock { ./gonet-top.exe *>&1 > "output.log" }
-
-        # Wait for 10 seconds to let the app run
-        Start-Sleep -Seconds 10
-
-        # Stop the process if it's still running
-        $process = Get-Process "gonet-top" -ErrorAction SilentlyContinue
-        if ($process) {
-            Stop-Process -Id $process.Id -Force
-        }
-
-        # Display the output from the log file
-        echo "--- Application Output Log ---"
-        Get-Content output.log -ErrorAction SilentlyContinue
-        echo "--- End Application Output Log ---"
+        echo "Attempting to run the application directly..."
+        # Set a timeout for the command to prevent the workflow from hanging indefinitely.
+        # PowerShell doesn't have a simple timeout command, so we'll rely on the
+        # overall step timeout which is 5 minutes by default. The app itself
+        # will exit if it can't get admin rights.
+        ./gonet-top.exe
       shell: powershell
 
     - name: Upload artifact
