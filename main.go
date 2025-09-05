@@ -7,14 +7,12 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/0xrawsec/golang-etw/etw"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/mitchellh/go-ps"
 )
 
