@@ -24,12 +24,31 @@ jobs:
 
     - name: Run and Test Application
       run: |
-        echo "Attempting to run the application directly..."
-        # Set a timeout for the command to prevent the workflow from hanging indefinitely.
-        # PowerShell doesn't have a simple timeout command, so we'll rely on the
-        # overall step timeout which is 5 minutes by default. The app itself
-        # will exit if it can't get admin rights.
-        ./gonet-top.exe
+        # Start the application in the background
+        Start-Process -FilePath "./gonet-top.exe"
+
+        # Give it a moment to initialize
+        Start-Sleep -Seconds 3
+
+        # Generate network traffic
+        echo "Generating network traffic..."
+        Invoke-WebRequest -Uri "https://www.google.com" -UseBasicParsing -ErrorAction SilentlyContinue
+
+        # Let the app run for a few more seconds to process events
+        Start-Sleep -Seconds 5
+
+        # Stop the process
+        Get-Process "gonet-top" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+        # Display the standard log file
+        echo "--- Application Log (app.log) ---"
+        Get-Content app.log -ErrorAction SilentlyContinue
+        echo "--- End Application Log ---"
+
+        # Display the TUI log file
+        echo "--- TUI Log (tui.log) ---"
+        Get-Content tui.log -ErrorAction SilentlyContinue
+        echo "--- End TUI Log ---"
       shell: powershell
 
     - name: Upload artifact

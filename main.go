@@ -28,7 +28,6 @@ func isAdmin() bool {
 // --- ETW and Data Structures ---
 
 const networkProviderGUID = "{7DD42A49-5329-4832-8DFD-43D979153A88}"
-
 const (
 	opcodeTCPSend    = 10
 	opcodeTCPReceive = 11
@@ -93,29 +92,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	doc := "gonet-top - Network Usage by Process\n\n"
-
-	headerStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("212")).
-		Padding(0, 1)
-
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
 	cellStyle := lipgloss.NewStyle().Padding(0, 1)
-
 	headers := []string{"PID", "Process Name", "Send Speed", "Recv Speed"}
-	headerRow := lipgloss.JoinHorizontal(
-		lipgloss.Left,
+	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
 		headerStyle.Copy().Width(10).Render(headers[0]),
 		headerStyle.Copy().Width(30).Render(headers[1]),
 		headerStyle.Copy().Width(15).Render(headers[2]),
 		headerStyle.Copy().Width(15).Render(headers[3]),
 	)
-
 	doc += headerRow + "\n"
-
 	for _, p := range m.processes {
 		pidStr := fmt.Sprintf("%d", p.PID)
-		row := lipgloss.JoinHorizontal(
-			lipgloss.Left,
+		row := lipgloss.JoinHorizontal(lipgloss.Left,
 			cellStyle.Copy().Width(10).Render(pidStr),
 			cellStyle.Copy().Width(30).Render(p.ProcessName),
 			cellStyle.Copy().Width(15).Render(p.SendSpeed),
@@ -123,7 +112,6 @@ func (m model) View() string {
 		)
 		doc += row + "\n"
 	}
-
 	doc += "\n\nPress 'q' or 'ctrl+c' to quit."
 	return doc
 }
@@ -141,10 +129,8 @@ func calculateRates() statsUpdatedMsg {
 	currentStats := statsMap.m
 	statsMap.m = make(map[uint32]*ProcessNetStats)
 	statsMap.Unlock()
-
 	pidNameCache.RLock()
 	defer pidNameCache.RUnlock()
-
 	var displayInfos []ProcessDisplayInfo
 	for pid, stats := range currentStats {
 		name, ok := pidNameCache.m[pid]
@@ -171,8 +157,7 @@ func formatSpeed(bytes uint64) string {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.2f %cB/s",
-		float64(bytes)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.2f %cB/s", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 // --- Process Name Discovery ---
@@ -190,52 +175,59 @@ func getProcessNames() (map[uint32]string, error) {
 }
 
 func startProcessNameWatcher() {
-	// Run once immediately on startup
-	names, err := getProcessNames()
-	if err == nil {
-		pidNameCache.Lock()
-		pidNameCache.m = names
-		pidNameCache.Unlock()
-	} else {
-		log.Printf("Initial error getting process names: %v", err)
-	}
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		<-ticker.C
+	update := func() {
 		names, err := getProcessNames()
 		if err != nil {
 			log.Printf("Error getting process names: %v", err)
-			continue
+			return
 		}
 		pidNameCache.Lock()
 		pidNameCache.m = names
 		pidNameCache.Unlock()
+	}
+	update() // Initial update
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+		update()
 	}
 }
 
 // --- Main and ETW Logic ---
 
 func main() {
+	// Setup logging to a file.
+	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+	if err != nil {
+		// Can't open log file, so just print to stderr and exit.
+		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
+		os.Exit(1)
+	}
+	log.SetOutput(logFile)
+
 	if !isAdmin() {
+		log.Println("Error: Administrator privileges are required.")
 		fmt.Println("Error: Administrator privileges are required.")
-		fmt.Println("Please restart the application from a terminal with 'Run as administrator'.")
-		time.Sleep(5 * time.Second)
 		return
 	}
 
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	// Setup TUI output to a different file
+	tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatalf("Failed to open TUI log file: %v", err)
+	}
+	defer tuiLogFile.Close()
+
+	p := tea.NewProgram(initialModel(), tea.WithOutput(tuiLogFile), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
-		os.Exit(1)
+		log.Fatalf("Alas, there's been an error: %v", err)
 	}
 }
 
 func startEtwConsumer() {
 	s := etw.NewRealTimeSession("gonet-top-session")
 	defer s.Stop()
-
 	if err := s.EnableProvider(etw.MustParseProvider(networkProviderGUID)); err != nil {
 		log.Printf("Failed to enable provider: %s", err)
 		return
