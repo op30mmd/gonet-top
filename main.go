@@ -7,14 +7,23 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/0xrawsec/golang-etw/etw"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/mitchellh/go-ps"
 )
+
+// --- Admin Check ---
+
+func isAdmin() bool {
+	_, err := os.Open("\\\\.\\PHYSICALDRIVE0")
+	return err == nil
+}
 
 // --- ETW and Data Structures ---
 
@@ -43,7 +52,7 @@ var pidNameCache = struct {
 	m map[uint32]string
 }{m: make(map[uint32]string)}
 
-// --- Bubble Tea Model (Temporarily Unused) ---
+// --- Bubble Tea Model ---
 
 type ProcessDisplayInfo struct {
 	PID         uint32
@@ -69,13 +78,54 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// ... (code is unused for now)
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		}
+	case statsUpdatedMsg:
+		m.processes = msg
+		return m, tick()
+	}
 	return m, nil
 }
 
 func (m model) View() string {
-	// ... (code is unused for now)
-	return ""
+	doc := "gonet-top - Network Usage by Process\n\n"
+
+	headerStyle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("212")).
+		Padding(0, 1)
+
+	cellStyle := lipgloss.NewStyle().Padding(0, 1)
+
+	headers := []string{"PID", "Process Name", "Send Speed", "Recv Speed"}
+	headerRow := lipgloss.JoinHorizontal(
+		lipgloss.Left,
+		headerStyle.Copy().Width(10).Render(headers[0]),
+		headerStyle.Copy().Width(30).Render(headers[1]),
+		headerStyle.Copy().Width(15).Render(headers[2]),
+		headerStyle.Copy().Width(15).Render(headers[3]),
+	)
+
+	doc += headerRow + "\n"
+
+	for _, p := range m.processes {
+		pidStr := fmt.Sprintf("%d", p.PID)
+		row := lipgloss.JoinHorizontal(
+			lipgloss.Left,
+			cellStyle.Copy().Width(10).Render(pidStr),
+			cellStyle.Copy().Width(30).Render(p.ProcessName),
+			cellStyle.Copy().Width(15).Render(p.SendSpeed),
+			cellStyle.Copy().Width(15).Render(p.RecvSpeed),
+		)
+		doc += row + "\n"
+	}
+
+	doc += "\n\nPress 'q' or 'ctrl+c' to quit."
+	return doc
 }
 
 // --- Ticker and Data Calculation ---
@@ -108,9 +158,6 @@ func calculateRates() statsUpdatedMsg {
 			RecvSpeed:   formatSpeed(stats.RecvBytes),
 		})
 	}
-	// Also log the calculated rates to the console for debugging
-	log.Printf("Calculated stats for %d processes.", len(displayInfos))
-
 	return statsUpdatedMsg(displayInfos)
 }
 
@@ -135,7 +182,6 @@ func getProcessNames() (map[uint32]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	pidMap := make(map[uint32]string, len(processes))
 	for _, p := range processes {
 		pidMap[uint32(p.Pid())] = p.Executable()
@@ -146,9 +192,7 @@ func getProcessNames() (map[uint32]string, error) {
 func startProcessNameWatcher() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
 	for {
-		<-ticker.C
 		names, err := getProcessNames()
 		if err != nil {
 			log.Printf("Error getting process names: %v", err)
@@ -157,29 +201,25 @@ func startProcessNameWatcher() {
 		pidNameCache.Lock()
 		pidNameCache.m = names
 		pidNameCache.Unlock()
+		<-ticker.C
 	}
 }
 
 // --- Main and ETW Logic ---
 
 func main() {
-	log.Println("Application starting...")
-
-	// Start the background processes
-	go startEtwConsumer()
-	go startProcessNameWatcher()
-
-	// For debugging, we'll just sleep and let the background tasks run.
-	// We'll also log the stats periodically.
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for i := 0; i < 7; i++ { // Run for ~14 seconds
-		<-ticker.C
-		calculateRates() // This will now log the number of processes it found
+	if !isAdmin() {
+		fmt.Println("Error: Administrator privileges are required.")
+		fmt.Println("Please restart the application from a terminal with 'Run as administrator'.")
+		time.Sleep(5 * time.Second)
+		return
 	}
 
-	log.Println("Application finished.")
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Printf("Alas, there's been an error: %v", err)
+		os.Exit(1)
+	}
 }
 
 func startEtwConsumer() {
@@ -190,47 +230,37 @@ func startEtwConsumer() {
 		log.Printf("Failed to enable provider: %s", err)
 		return
 	}
-
 	c := etw.NewRealTimeConsumer(context.Background())
 	defer c.Stop()
-
 	c.FromSessions(s)
-
 	go func() {
 		for e := range c.Events {
 			opcode := e.System.Opcode.Value
 			isSend := opcode == opcodeTCPSend || opcode == opcodeUDPSend
 			isRecv := opcode == opcodeTCPReceive || opcode == opcodeUDPReceive
-
 			if !isSend && !isRecv {
 				continue
 			}
-
 			pidStr, pidOk := e.EventData["PID"].(string)
 			sizeStr, sizeOk := e.EventData["size"].(string)
-
 			if !pidOk || !sizeOk {
 				continue
 			}
-
 			pid64, err := strconv.ParseUint(pidStr, 10, 32)
 			if err != nil {
 				continue
 			}
 			pid := uint32(pid64)
-
 			size, err := strconv.ParseUint(sizeStr, 10, 64)
 			if err != nil {
 				continue
 			}
-
 			statsMap.Lock()
 			stats, ok := statsMap.m[pid]
 			if !ok {
 				stats = &ProcessNetStats{PID: pid}
 				statsMap.m[pid] = stats
 			}
-
 			if isSend {
 				stats.SentBytes += size
 			} else if isRecv {
@@ -239,7 +269,6 @@ func startEtwConsumer() {
 			statsMap.Unlock()
 		}
 	}()
-
 	if err := c.Start(); err != nil {
 		log.Printf("Error starting consumer: %s", err)
 	}
