@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"sync"
 	"time"
 
@@ -197,31 +196,17 @@ func startProcessNameWatcher() {
 // --- Main and ETW Logic ---
 
 func main() {
-	// Setup logging to a file.
-	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
-	if err != nil {
-		// Can't open log file, so just print to stderr and exit.
-		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
-		os.Exit(1)
-	}
-	log.SetOutput(logFile)
-
 	if !isAdmin() {
-		log.Println("Error: Administrator privileges are required.")
 		fmt.Println("Error: Administrator privileges are required.")
+		fmt.Println("Please restart the application from a terminal with 'Run as administrator'.")
+		time.Sleep(5 * time.Second)
 		return
 	}
 
-	// Setup TUI output to a different file
-	tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		log.Fatalf("Failed to open TUI log file: %v", err)
-	}
-	defer tuiLogFile.Close()
-
-	p := tea.NewProgram(initialModel(), tea.WithOutput(tuiLogFile), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		log.Fatalf("Alas, there's been an error: %v", err)
+		fmt.Printf("Alas, there's been an error: %v", err)
+		os.Exit(1)
 	}
 }
 
@@ -243,20 +228,17 @@ func startEtwConsumer() {
 			if !isSend && !isRecv {
 				continue
 			}
-			pidStr, pidOk := e.EventData["PID"].(string)
-			sizeStr, sizeOk := e.EventData["size"].(string)
+
+			// Correctly assert the types for PID and size.
+			// They are integers in the raw event, not strings.
+			pid, pidOk := e.EventData["PID"].(uint32)
+			size32, sizeOk := e.EventData["size"].(uint32)
+
 			if !pidOk || !sizeOk {
 				continue
 			}
-			pid64, err := strconv.ParseUint(pidStr, 10, 32)
-			if err != nil {
-				continue
-			}
-			pid := uint32(pid64)
-			size, err := strconv.ParseUint(sizeStr, 10, 64)
-			if err != nil {
-				continue
-			}
+			size := uint64(size32)
+
 			statsMap.Lock()
 			stats, ok := statsMap.m[pid]
 			if !ok {

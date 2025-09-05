@@ -22,7 +22,7 @@ jobs:
     - name: Build
       run: go build -o gonet-top.exe .
 
-    - name: Run and Test Application
+    - name: Run application and generate traffic
       run: |
         # Start the application in the background
         Start-Process -FilePath "./gonet-top.exe"
@@ -35,20 +35,30 @@ jobs:
         Invoke-WebRequest -Uri "https://www.google.com" -UseBasicParsing -ErrorAction SilentlyContinue
 
         # Let the app run for a few more seconds to process events
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds 7
 
         # Stop the process
         Get-Process "gonet-top" -ErrorAction SilentlyContinue | Stop-Process -Force
+      shell: powershell
 
-        # Display the standard log file
+    - name: Check for application output
+      run: |
+        # The application logs errors and TUI output to files.
+        # We can check if these files were created and have content.
         echo "--- Application Log (app.log) ---"
-        Get-Content app.log -ErrorAction SilentlyContinue
+        if (Test-Path app.log) { Get-Content app.log } else { echo "app.log not found." }
         echo "--- End Application Log ---"
 
-        # Display the TUI log file
         echo "--- TUI Log (tui.log) ---"
-        Get-Content tui.log -ErrorAction SilentlyContinue
+        if (Test-Path tui.log) { Get-Content tui.log } else { echo "tui.log not found." }
         echo "--- End TUI Log ---"
+
+        # Fail the step if the TUI log is empty or doesn't exist, as it should always produce output.
+        $tuiLog = Get-Content tui.log -ErrorAction SilentlyContinue
+        if (-not $tuiLog) {
+            echo "Error: TUI log is empty or missing. The application may have failed to start."
+            exit 1
+        }
       shell: powershell
 
     - name: Upload artifact
