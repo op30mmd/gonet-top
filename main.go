@@ -45,17 +45,15 @@ var pidNameCache = struct {
 	m map[uint32]string
 }{m: make(map[uint32]string)}
 
-// --- Bubble Tea Model ---
+// --- Bubble Tea Model (Temporarily Unused) ---
 
-// ProcessDisplayInfo holds the calculated and formatted data for one process.
 type ProcessDisplayInfo struct {
-	PID       uint32
+	PID         uint32
 	ProcessName string
-	SendSpeed string
-	RecvSpeed string
+	SendSpeed   string
+	RecvSpeed   string
 }
 
-// statsUpdatedMsg is the message sent when new stats are ready.
 type statsUpdatedMsg []ProcessDisplayInfo
 
 type model struct {
@@ -73,54 +71,13 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			return m, tea.Quit
-		}
-	case statsUpdatedMsg:
-		m.processes = msg
-		return m, tick() // Schedule the next tick
-	}
+	// ... (code is unused for now)
 	return m, nil
 }
 
 func (m model) View() string {
-	doc := "gonet-top - Network Usage by Process\n\n"
-
-	headerStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("212")).
-		Padding(0, 1)
-
-	cellStyle := lipgloss.NewStyle().Padding(0, 1)
-
-	headers := []string{"PID", "Process Name", "Send Speed", "Recv Speed"}
-	headerRow := lipgloss.JoinHorizontal(
-		lipgloss.Left,
-		headerStyle.Copy().Width(10).Render(headers[0]),
-		headerStyle.Copy().Width(30).Render(headers[1]),
-		headerStyle.Copy().Width(15).Render(headers[2]),
-		headerStyle.Copy().Width(15).Render(headers[3]),
-	)
-
-	doc += headerRow + "\n"
-
-	for _, p := range m.processes {
-		pidStr := fmt.Sprintf("%d", p.PID)
-		row := lipgloss.JoinHorizontal(
-			lipgloss.Left,
-			cellStyle.Copy().Width(10).Render(pidStr),
-			cellStyle.Copy().Width(30).Render(p.ProcessName),
-			cellStyle.Copy().Width(15).Render(p.SendSpeed),
-			cellStyle.Copy().Width(15).Render(p.RecvSpeed),
-		)
-		doc += row + "\n"
-	}
-
-	doc += "\n\nPress 'q' or 'ctrl+c' to quit."
-	return doc
+	// ... (code is unused for now)
+	return ""
 }
 
 // --- Ticker and Data Calculation ---
@@ -133,12 +90,10 @@ func tick() tea.Cmd {
 
 func calculateRates() statsUpdatedMsg {
 	statsMap.Lock()
-	// Atomically swap the map with a new empty one.
 	currentStats := statsMap.m
 	statsMap.m = make(map[uint32]*ProcessNetStats)
 	statsMap.Unlock()
 
-	// Now, we can process the captured `currentStats` map without locks.
 	pidNameCache.RLock()
 	defer pidNameCache.RUnlock()
 
@@ -155,6 +110,8 @@ func calculateRates() statsUpdatedMsg {
 			RecvSpeed:   formatSpeed(stats.RecvBytes),
 		})
 	}
+	// Also log the calculated rates to the console for debugging
+	log.Printf("Calculated stats for %d processes.", len(displayInfos))
 
 	return statsUpdatedMsg(displayInfos)
 }
@@ -196,7 +153,6 @@ func startProcessNameWatcher() {
 		<-ticker.C
 		names, err := getProcessNames()
 		if err != nil {
-			// Log the error but continue; we don't want to crash the app.
 			log.Printf("Error getting process names: %v", err)
 			continue
 		}
@@ -206,16 +162,26 @@ func startProcessNameWatcher() {
 	}
 }
 
-
 // --- Main and ETW Logic ---
 
 func main() {
 	log.Println("Application starting...")
-	p := tea.NewProgram(initialModel())
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
-		os.Exit(1)
+
+	// Start the background processes
+	go startEtwConsumer()
+	go startProcessNameWatcher()
+
+	// For debugging, we'll just sleep and let the background tasks run.
+	// We'll also log the stats periodically.
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for i := 0; i < 7; i++ { // Run for ~14 seconds
+		<-ticker.C
+		calculateRates() // This will now log the number of processes it found
 	}
+
+	log.Println("Application finished.")
 }
 
 func startEtwConsumer() {
