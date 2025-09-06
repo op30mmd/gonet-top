@@ -192,6 +192,9 @@ type model struct {
     pendingSortTime time.Time
     width          int // Terminal width
     height         int // Terminal height
+    // Goroutine control
+    nameWatcherDone   chan struct{}
+    startTimeWatcherDone chan struct{}
 }
 
 func initialModel() model {
@@ -207,13 +210,16 @@ func initialModel() model {
         pendingSort:    -1, // No pending sort
         width:          80,  // Default width
         height:         24,  // Default height
+        nameWatcherDone: make(chan struct{}),
+        startTimeWatcherDone: make(chan struct{}),
     }
 }
 
 func (m model) Init() tea.Cmd {
+    // Start background goroutines with proper cleanup channels
     go startNetworkMonitor()
-    go startProcessNameWatcher()
-    go startProcessStartTimeWatcher()
+    go startProcessNameWatcher(m.nameWatcherDone)
+    go startProcessStartTimeWatcher(m.startTimeWatcherDone)
     return tickWithSortAndDelay(m.sortBy, m.refreshDelay)
 }
 
@@ -222,6 +228,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     case tea.KeyMsg:
         switch msg.String() {
         case "ctrl+c", "q":
+            // Signal goroutines to stop
+            close(m.nameWatcherDone)
+            close(m.startTimeWatcherDone)
             return m, tea.Quit
         case "up", "k":
             if m.showSettings {
@@ -840,7 +849,7 @@ func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
         if processMap[pid] == nil {
             processMap[pid] = &ProcessNetDetails{
                 PID:         pid,
-                RemoteHosts: make(map[string]uint32),
+                RemoteHosts: make(map[string]uint32]),
                 Connections: make([]NetworkConnection, 0),
                 LastRemoteDest: "",
                 LastRemoteTime: time.Time{},
@@ -1279,7 +1288,7 @@ func getProcessNames() (map[uint32]string, error) {
     return pidMap, nil
 }
 
-func startProcessNameWatcher() {
+func startProcessNameWatcher(done chan struct{}) {
     update := func() {
         names, err := getProcessNames()
         if err != nil {
@@ -1295,13 +1304,18 @@ func startProcessNameWatcher() {
     ticker := time.NewTicker(5 * time.Second)
     defer ticker.Stop()
     for {
-        <-ticker.C
-        update()
+        select {
+        case <-ticker.C:
+            update()
+        case <-done:
+            log.Println("Process name watcher stopping")
+            return
+        }
     }
 }
 
 // --- Process Start Time Watcher ---
-func startProcessStartTimeWatcher() {
+func startProcessStartTimeWatcher(done chan struct{}) {
     update := func() {
         processes, err := ps.Processes()
         if err != nil {
@@ -1328,8 +1342,13 @@ func startProcessStartTimeWatcher() {
     ticker := time.NewTicker(10 * time.Second) // Update less frequently than names
     defer ticker.Stop()
     for {
-        <-ticker.C
-        update()
+        select {
+        case <-ticker.C:
+            update()
+        case <-done:
+            log.Println("Process start time watcher stopping")
+            return
+        }
     }
 }
 
@@ -1382,8 +1401,9 @@ func main() {
         fmt.Println("Enhanced Debug mode enabled - Detailed network connections will be logged to console")
         fmt.Println("Press Ctrl+C to exit")
         // In debug mode, just show network stats periodically
-        go startProcessNameWatcher()
-        go startProcessStartTimeWatcher()
+        done := make(chan struct{})
+        go startProcessNameWatcher(done)
+        go startProcessStartTimeWatcher(done)
         ticker := time.NewTicker(3 * time.Second)
         defer ticker.Stop()
         for {
