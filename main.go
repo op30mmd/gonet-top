@@ -153,17 +153,22 @@ type model struct {
     viewMode       int // 0: summary, 1: detailed, 2: connections view
     sortBy         int // 0: total connections, 1: upload rate, 2: download rate, 3: process name, 4: PID, 5: total IO
     refreshDelay   time.Duration
+    sortDelay      time.Duration
     showSettings   bool
+    pendingSort    int
+    pendingSortTime time.Time
 }
 func initialModel() model {
     return model{
-        lastUpdate:    time.Now(),
-        selectedIdx:   0,
-        showDetails:   false,
-        viewMode:      0,
-        sortBy:        0,
-        refreshDelay:  2 * time.Second,
-        showSettings:  false,
+        lastUpdate:     time.Now(),
+        selectedIdx:    0,
+        showDetails:    false,
+        viewMode:       0,
+        sortBy:         0,
+        refreshDelay:   2 * time.Second,
+        sortDelay:      500 * time.Millisecond, // 500ms delay for sorting
+        showSettings:   false,
+        pendingSort:    -1, // No pending sort
     }
 }
 func (m model) Init() tea.Cmd {
@@ -197,6 +202,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             } else if m.selectedIdx < len(m.processes)-1 {
                 m.selectedIdx++
             }
+        case "left", "h":
+            if m.showSettings {
+                // In settings mode, adjust sort delay
+                if m.sortDelay < 2*time.Second {
+                    m.sortDelay += 100 * time.Millisecond
+                }
+                return m, nil
+            }
+        case "right", "l":
+            if m.showSettings {
+                // In settings mode, adjust sort delay
+                if m.sortDelay > 100*time.Millisecond {
+                    m.sortDelay -= 100 * time.Millisecond
+                }
+                return m, nil
+            }
         case "enter", " ":
             if m.showSettings {
                 // Exit settings mode
@@ -209,8 +230,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case "d":
             m.showDetails = !m.showDetails
         case "s":
-            m.sortBy = (m.sortBy + 1) % 6 // Now 6 sort options (0-5)
-            return m, tickWithSortAndDelay(m.sortBy, m.refreshDelay) // Trigger immediate refresh with new sort
+            // Set a pending sort instead of immediately sorting
+            newSort := (m.sortBy + 1) % 6 // Now 6 sort options (0-5)
+            m.pendingSort = newSort
+            m.pendingSortTime = time.Now()
+            return m, nil
         case "r":
             m.showSettings = !m.showSettings
         }
@@ -238,10 +262,26 @@ func (m model) View() string {
     doc.WriteString(fmt.Sprintf("Last updated: %s | Active processes: %d | Selected: %d\n\n", 
         m.lastUpdate.Format("15:04:05"), len(m.processes), m.selectedIdx+1))
     
+    // Check if we have a pending sort
+    if m.pendingSort >= 0 {
+        timeSincePending := time.Since(m.pendingSortTime)
+        if timeSincePending >= m.sortDelay {
+            // Apply the pending sort
+            m.sortBy = m.pendingSort
+            m.pendingSort = -1
+            // Trigger a refresh with the new sort
+            return doc.String() + m.renderPendingSortView()
+        } else {
+            // Show pending sort indicator
+            remainingTime := m.sortDelay - timeSincePending
+            doc.WriteString(fmt.Sprintf("Sorting in %.1fs... (Press 's' to cancel)\n\n", remainingTime.Seconds()))
+        }
+    }
+    
     // Controls
     if m.showSettings {
-        doc.WriteString("Settings Mode - Refresh Delay: ↑=increase, ↓=decrease, Enter=exit\n\n")
-        doc.WriteString(fmt.Sprintf("Current refresh delay: %v\n\n", m.refreshDelay))
+        doc.WriteString("Settings Mode - Refresh: ↑/↓=adjust, Sort Delay: ←/→=adjust, Enter=exit\n\n")
+        doc.WriteString(fmt.Sprintf("Current refresh delay: %v | Current sort delay: %v\n\n", m.refreshDelay, m.sortDelay))
     } else {
         doc.WriteString("Controls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, r=settings, q=quit\n\n")
     }
@@ -263,6 +303,82 @@ func (m model) View() string {
         return doc.String() + m.renderSummaryView()
     }
 }
+func (m model) renderPendingSortView() string {
+    var doc strings.Builder
+    
+    headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
+    cellStyle := lipgloss.NewStyle().Padding(0, 1)
+    selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
+    headers := []string{"PID", "Process Name", "TCP", "UDP", "Total", "Upload", "Download"}
+    headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
+        headerStyle.Copy().Width(8).Render(headers[0]),
+        headerStyle.Copy().Width(16).Render(headers[1]),
+        headerStyle.Copy().Width(6).Render(headers[2]),
+        headerStyle.Copy().Width(6).Render(headers[3]),
+        headerStyle.Copy().Width(6).Render(headers[4]),
+        headerStyle.Copy().Width(10).Render(headers[5]),
+        headerStyle.Copy().Width(10).Render(headers[6]),
+    )
+    doc.WriteString(headerRow + "\n")
+    
+    // Sort the processes with the new sort method
+    sortedProcesses := make([]ProcessDisplayInfo, len(m.processes))
+    copy(sortedProcesses, m.processes)
+    
+    switch m.pendingSort {
+    case 1: // Sort by upload rate
+        sort.Slice(sortedProcesses, func(i, j int) bool {
+            return sortedProcesses[i].UploadRateValue > sortedProcesses[j].UploadRateValue
+        })
+    case 2: // Sort by download rate
+        sort.Slice(sortedProcesses, func(i, j int) bool {
+            return sortedProcesses[i].DownloadRateValue > sortedProcesses[j].DownloadRateValue
+        })
+    case 3: // Sort by process name
+        sort.Slice(sortedProcesses, func(i, j int) bool {
+            return sortedProcesses[i].ProcessName < sortedProcesses[j].ProcessName
+        })
+    case 4: // Sort by PID
+        sort.Slice(sortedProcesses, func(i, j int) bool {
+            return sortedProcesses[i].PID < sortedProcesses[j].PID
+        })
+    case 5: // Sort by total IO
+        sort.Slice(sortedProcesses, func(i, j int) bool {
+            return sortedProcesses[i].TotalIO > sortedProcesses[j].TotalIO
+        })
+    default: // Sort by total connections
+        sort.Slice(sortedProcesses, func(i, j int) bool {
+            return sortedProcesses[i].TotalConns > sortedProcesses[j].TotalConns
+        })
+    }
+    
+    for i, p := range sortedProcesses {
+        style := cellStyle
+        if i == m.selectedIdx {
+            style = selectedStyle
+        }
+        row := lipgloss.JoinHorizontal(lipgloss.Left,
+            style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
+            style.Copy().Width(16).Render(truncateString(p.ProcessName, 14)),
+            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TCPConns)),
+            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.UDPConns)),
+            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TotalConns)),
+            style.Copy().Width(10).Render(p.UploadRate),
+            style.Copy().Width(10).Render(p.DownloadRate),
+        )
+        doc.WriteString(row + "\n")
+    }
+    
+    // Show the rest of the controls
+    if m.showSettings {
+        doc.WriteString("\nSettings Mode - Refresh: ↑/↓=adjust, Sort Delay: ←/→=adjust, Enter=exit\n\n")
+        doc.WriteString(fmt.Sprintf("Current refresh delay: %v | Current sort delay: %v\n", m.refreshDelay, m.sortDelay))
+    } else {
+        doc.WriteString("\nControls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, r=settings, q=quit\n\n")
+    }
+    
+    return doc.String()
+}
 func (m model) getViewModeName() string {
     switch m.viewMode {
     case 0:
@@ -276,6 +392,25 @@ func (m model) getViewModeName() string {
     }
 }
 func (m model) getSortModeName() string {
+    if m.pendingSort >= 0 {
+        switch m.pendingSort {
+        case 0:
+            return "Connections"
+        case 1:
+            return "Upload"
+        case 2:
+            return "Download"
+        case 3:
+            return "Process"
+        case 4:
+            return "PID"
+        case 5:
+            return "Total IO"
+        default:
+            return "Unknown"
+        }
+    }
+    
     switch m.sortBy {
     case 0:
         return "Connections"
@@ -990,7 +1125,8 @@ func main() {
         fmt.Println("- Detailed view: Shows established connections and top remote hosts")
         fmt.Println("- Connections view: Lists all active connections for selected process")
         fmt.Println("- Sort options: connections, upload rate, download rate, process name, PID, total IO")
-        fmt.Println("- Press 'r' to adjust refresh delay settings")
+        fmt.Println("- Delayed sorting with configurable delay time")
+        fmt.Println("- Press 'r' to adjust refresh and sort delay settings")
         fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
         fmt.Println("- Press Enter or 'd' to toggle process details")
         fmt.Println("\nStarting in 3 seconds...")
