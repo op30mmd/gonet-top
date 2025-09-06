@@ -139,32 +139,37 @@ type ProcessDisplayInfo struct {
     Connections        []NetworkConnection
     UploadRateValue    float64 // For sorting
     DownloadRateValue  float64 // For sorting
+    TotalIO            uint64  // For sorting (total bytes in + out)
 }
 type statsUpdatedMsg struct {
     processes []ProcessDisplayInfo
     sortBy    int
 }
 type model struct {
-    processes   []ProcessDisplayInfo
-    lastUpdate  time.Time
-    selectedIdx int
-    showDetails bool
-    viewMode    int // 0: summary, 1: detailed, 2: connections view
-    sortBy      int // 0: total connections, 1: upload rate, 2: download rate
+    processes      []ProcessDisplayInfo
+    lastUpdate     time.Time
+    selectedIdx    int
+    showDetails    bool
+    viewMode       int // 0: summary, 1: detailed, 2: connections view
+    sortBy         int // 0: total connections, 1: upload rate, 2: download rate, 3: process name, 4: PID, 5: total IO
+    refreshDelay   time.Duration
+    showSettings   bool
 }
 func initialModel() model {
     return model{
-        lastUpdate:  time.Now(),
-        selectedIdx: 0,
-        showDetails: false,
-        viewMode:    0,
-        sortBy:      0,
+        lastUpdate:    time.Now(),
+        selectedIdx:   0,
+        showDetails:   false,
+        viewMode:      0,
+        sortBy:        0,
+        refreshDelay:  2 * time.Second,
+        showSettings:  false,
     }
 }
 func (m model) Init() tea.Cmd {
     go startNetworkMonitor()
     go startProcessNameWatcher()
-    return tickWithSort(m.sortBy)
+    return tickWithSortAndDelay(m.sortBy, m.refreshDelay)
 }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
@@ -173,22 +178,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case "ctrl+c", "q":
             return m, tea.Quit
         case "up", "k":
-            if m.selectedIdx > 0 {
+            if m.showSettings {
+                // In settings mode, adjust refresh delay
+                if m.refreshDelay < 10*time.Second {
+                    m.refreshDelay += time.Second
+                }
+                return m, nil
+            } else if m.selectedIdx > 0 {
                 m.selectedIdx--
             }
         case "down", "j":
-            if m.selectedIdx < len(m.processes)-1 {
+            if m.showSettings {
+                // In settings mode, adjust refresh delay
+                if m.refreshDelay > time.Second {
+                    m.refreshDelay -= time.Second
+                }
+                return m, nil
+            } else if m.selectedIdx < len(m.processes)-1 {
                 m.selectedIdx++
             }
         case "enter", " ":
-            m.showDetails = !m.showDetails
+            if m.showSettings {
+                // Exit settings mode
+                m.showSettings = false
+            } else {
+                m.showDetails = !m.showDetails
+            }
         case "tab":
             m.viewMode = (m.viewMode + 1) % 3
         case "d":
             m.showDetails = !m.showDetails
         case "s":
-            m.sortBy = (m.sortBy + 1) % 3
-            return m, tickWithSort(m.sortBy) // Trigger immediate refresh with new sort
+            m.sortBy = (m.sortBy + 1) % 6 // Now 6 sort options (0-5)
+            return m, tickWithSortAndDelay(m.sortBy, m.refreshDelay) // Trigger immediate refresh with new sort
+        case "r":
+            m.showSettings = !m.showSettings
         }
     case statsUpdatedMsg:
         oldSelected := m.selectedIdx
@@ -202,7 +226,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         } else {
             m.selectedIdx = oldSelected
         }
-        return m, tickWithSort(m.sortBy)
+        return m, tickWithSortAndDelay(m.sortBy, m.refreshDelay)
     }
     return m, nil
 }
@@ -213,13 +237,21 @@ func (m model) View() string {
     doc.WriteString(fmt.Sprintf("gonet-top - Enhanced Network Monitor | Mode: %s | Sort: %s\n", m.getViewModeName(), m.getSortModeName()))
     doc.WriteString(fmt.Sprintf("Last updated: %s | Active processes: %d | Selected: %d\n\n", 
         m.lastUpdate.Format("15:04:05"), len(m.processes), m.selectedIdx+1))
+    
     // Controls
-    doc.WriteString("Controls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, q=quit\n\n")
+    if m.showSettings {
+        doc.WriteString("Settings Mode - Refresh Delay: ↑=increase, ↓=decrease, Enter=exit\n\n")
+        doc.WriteString(fmt.Sprintf("Current refresh delay: %v\n\n", m.refreshDelay))
+    } else {
+        doc.WriteString("Controls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, r=settings, q=quit\n\n")
+    }
+    
     if len(m.processes) == 0 {
         doc.WriteString("No network connections detected...\n")
         doc.WriteString("Try browsing the web or starting network applications.\n")
         return doc.String()
     }
+    
     switch m.viewMode {
     case 0:
         return doc.String() + m.renderSummaryView()
@@ -251,6 +283,12 @@ func (m model) getSortModeName() string {
         return "Upload"
     case 2:
         return "Download"
+    case 3:
+        return "Process"
+    case 4:
+        return "PID"
+    case 5:
+        return "Total IO"
     default:
         return "Unknown"
     }
@@ -422,9 +460,9 @@ func formatBytesPerSecond(bytesPerSec float64) string {
         return fmt.Sprintf("%.1f G", bytesPerSec/(1024*1024*1024))
     }
 }
-// --- Ticker with sort parameter ---
-func tickWithSort(sortBy int) tea.Cmd {
-    return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
+// --- Ticker with sort and delay parameters ---
+func tickWithSortAndDelay(sortBy int, delay time.Duration) tea.Cmd {
+    return tea.Tick(delay, func(t time.Time) tea.Msg {
         return getEnhancedNetworkStats(sortBy)
     })
 }
@@ -665,6 +703,8 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
             ioCounters = IO_COUNTERS{} // Use zero values
         }
         
+        totalIO := ioCounters.ReadTransferCount + ioCounters.WriteTransferCount
+        
         displayInfos = append(displayInfos, ProcessDisplayInfo{
             PID:                pid,
             ProcessName:        name,
@@ -682,6 +722,7 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
             Connections:        connections,
             UploadRateValue:    uploadRate,
             DownloadRateValue:  downloadRate,
+            TotalIO:            totalIO,
         })
         
         // Update the stats map with current values for next calculation
@@ -707,6 +748,18 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
     case 2: // Sort by download rate
         sort.Slice(displayInfos, func(i, j int) bool {
             return displayInfos[i].DownloadRateValue > displayInfos[j].DownloadRateValue
+        })
+    case 3: // Sort by process name
+        sort.Slice(displayInfos, func(i, j int) bool {
+            return displayInfos[i].ProcessName < displayInfos[j].ProcessName
+        })
+    case 4: // Sort by PID
+        sort.Slice(displayInfos, func(i, j int) bool {
+            return displayInfos[i].PID < displayInfos[j].PID
+        })
+    case 5: // Sort by total IO
+        sort.Slice(displayInfos, func(i, j int) bool {
+            return displayInfos[i].TotalIO > displayInfos[j].TotalIO
         })
     default: // Sort by total connections
         sort.Slice(displayInfos, func(i, j int) bool {
@@ -936,7 +989,8 @@ func main() {
         fmt.Println("- Summary view: Basic connection counts and network I/O rates")
         fmt.Println("- Detailed view: Shows established connections and top remote hosts")
         fmt.Println("- Connections view: Lists all active connections for selected process")
-        fmt.Println("- Press 's' to change sorting method (connections, upload, download)")
+        fmt.Println("- Sort options: connections, upload rate, download rate, process name, PID, total IO")
+        fmt.Println("- Press 'r' to adjust refresh delay settings")
         fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
         fmt.Println("- Press Enter or 'd' to toggle process details")
         fmt.Println("\nStarting in 3 seconds...")
