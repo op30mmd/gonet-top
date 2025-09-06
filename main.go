@@ -1523,7 +1523,7 @@ func main() {
     var p *tea.Program
     if isCI {
         // In CI, output TUI to file for testing
-        tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY|os_O_TRUNC, 0666)
+        tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
         if err != nil {
             log.Fatalf("Failed to open TUI log file: %v", err)
         }
