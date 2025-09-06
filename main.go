@@ -255,7 +255,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                     m.refreshDelay += time.Second
                 }
                 return m, nil
-            } else if m.selectedIdx > 0 {
+            } else if len(m.processes) > 0 && m.selectedIdx > 0 {
                 m.selectedIdx--
             }
         case "down", "j":
@@ -265,7 +265,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                     m.refreshDelay -= time.Second
                 }
                 return m, nil
-            } else if m.selectedIdx < len(m.processes)-1 {
+            } else if len(m.processes) > 0 && m.selectedIdx < len(m.processes)-1 {
                 m.selectedIdx++
             }
         case "left", "h":
@@ -296,6 +296,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case "d":
             m.showDetails = !m.showDetails
         case "s":
+            // Cancel any existing pending sort
+            if m.pendingSort >= 0 {
+                m.pendingSort = -1
+                return m, nil
+            }
+            
             // Set a pending sort instead of immediately sorting
             newSort := (m.sortBy + 1) % 6 // Now 6 sort options (0-5)
             m.pendingSort = newSort
@@ -323,11 +329,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         m.processes = msg.processes
         // Don't update m.sortBy from the message, keep the current model value
         m.lastUpdate = time.Now()
-        // Keep selection in bounds
-        if oldSelected >= len(m.processes) && len(m.processes) > 0 {
-            m.selectedIdx = len(m.processes) - 1
-        } else if len(m.processes) == 0 {
+        // Keep selection in bounds with proper checks
+        if len(m.processes) == 0 {
             m.selectedIdx = 0
+        } else if oldSelected >= len(m.processes) {
+            m.selectedIdx = len(m.processes) - 1
         } else {
             m.selectedIdx = oldSelected
         }
