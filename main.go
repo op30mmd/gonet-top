@@ -927,7 +927,7 @@ func sortByDownloadRate(a, b ProcessDisplayInfo) bool {
 }
 
 func sortByTotalIO(a, b ProcessDisplayInfo) bool {
-    // If both have IO data, sort by total IO
+    // If both have IO data, sort by total IO (descending)
     if a.HasIOData && b.HasIOData {
         return a.TotalIO > b.TotalIO
     }
