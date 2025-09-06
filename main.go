@@ -190,7 +190,6 @@ type ProcessDisplayInfo struct {
 
 type statsUpdatedMsg struct {
     processes []ProcessDisplayInfo
-    sortBy    int
 }
 
 type checkPendingSortMsg struct{}
@@ -322,7 +321,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     case statsUpdatedMsg:
         oldSelected := m.selectedIdx
         m.processes = msg.processes
-        m.sortBy = msg.sortBy // Update the sort mode with the value from the message
+        // Don't update m.sortBy from the message, keep the current model value
         m.lastUpdate = time.Now()
         // Keep selection in bounds
         if oldSelected >= len(m.processes) && len(m.processes) > 0 {
@@ -1240,7 +1239,6 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
     
     return statsUpdatedMsg{
         processes: displayInfos,
-        sortBy:    sortBy,
     }
 }
 
