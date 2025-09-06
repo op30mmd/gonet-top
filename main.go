@@ -284,7 +284,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 }
                 return m, nil
             }
-        case "enter", " ":
+        case "enter":
+            if m.showSettings {
+                // Exit settings mode
+                m.showSettings = false
+            } else {
+                m.showDetails = !m.showDetails
+            }
+        case " ":
             if m.showSettings {
                 // Exit settings mode
                 m.showSettings = false
@@ -294,7 +301,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case "tab":
             m.viewMode = (m.viewMode + 1) % 3
         case "d":
-            m.showDetails = !m.showDetails
+            if m.showSettings {
+                // Exit settings mode
+                m.showSettings = false
+            } else {
+                m.showDetails = !m.showDetails
+            }
         case "s":
             // Cancel any existing pending sort
             if m.pendingSort >= 0 {
@@ -1144,7 +1156,7 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
             // Estimate system process IO based on uptime and connections
             if !startTime.IsZero() {
                 uptime := now.Sub(startTime)
-                estimatedIO := uint64(uptime.Seconds()) * uint64(totalCount) * 1024 * 10 // 10KB per second per connection
+                estimatedIO := uint64(uptime.Seconds()) * uint32(totalCount) * 1024 * 10 // 10KB per second per connection
                 totalIO = estimatedIO
                 // Also estimate rates for system processes
                 uploadRate = float64(estimatedIO/2) / uptime.Seconds()
