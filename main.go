@@ -206,16 +206,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	var doc strings.Builder
 	
-	// Header
-	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	doc.WriteString(headerStyle.Render("gonet-top - Enhanced Network Monitor"))
-	doc.WriteString(fmt.Sprintf(" | Mode: %s", m.getViewModeName()))
-	doc.WriteString(fmt.Sprintf(" | Last updated: %s\n", m.lastUpdate.Format("15:04:05")))
-	doc.WriteString(fmt.Sprintf("Active processes: %d | Selected: %d\n\n", len(m.processes), m.selectedIdx+1))
+	// Header - keep it simple
+	doc.WriteString(fmt.Sprintf("gonet-top - Enhanced Network Monitor | Mode: %s\n", m.getViewModeName()))
+	doc.WriteString(fmt.Sprintf("Last updated: %s | Active processes: %d | Selected: %d\n\n", 
+		m.lastUpdate.Format("15:04:05"), len(m.processes), m.selectedIdx+1))
 
 	// Controls
-	controlStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	doc.WriteString(controlStyle.Render("Controls: ↑/↓ or j/k=navigate, Enter/d=details, Tab=view mode, q=quit\n\n"))
+	doc.WriteString("Controls: ↑/↓=navigate, Enter/d=details, Tab=view mode, q=quit\n\n")
 
 	if len(m.processes) == 0 {
 		doc.WriteString("No network connections detected...\n")
