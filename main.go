@@ -164,7 +164,7 @@ func initialModel() model {
 func (m model) Init() tea.Cmd {
     go startNetworkMonitor()
     go startProcessNameWatcher()
-    return tick()
+    return tickWithSort(m.sortBy)
 }
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
@@ -188,6 +188,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             m.showDetails = !m.showDetails
         case "s":
             m.sortBy = (m.sortBy + 1) % 3
+            return m, tickWithSort(m.sortBy) // Trigger immediate refresh with new sort
         }
     case statsUpdatedMsg:
         oldSelected := m.selectedIdx
@@ -201,7 +202,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         } else {
             m.selectedIdx = oldSelected
         }
-        return m, tick()
+        return m, tickWithSort(m.sortBy)
     }
     return m, nil
 }
@@ -421,13 +422,10 @@ func formatBytesPerSecond(bytesPerSec float64) string {
         return fmt.Sprintf("%.1f G", bytesPerSec/(1024*1024*1024))
     }
 }
-// --- Ticker ---
-func tick() tea.Cmd {
+// --- Ticker with sort parameter ---
+func tickWithSort(sortBy int) tea.Cmd {
     return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
-        // We need to get the current sort mode from the model
-        // Since we can't access it directly, we'll pass 0 for now
-        // and handle sorting in the Update method
-        return getEnhancedNetworkStats(0)
+        return getEnhancedNetworkStats(sortBy)
     })
 }
 // --- Get Process I/O Counters ---
