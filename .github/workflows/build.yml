@@ -66,3 +66,12 @@ jobs:
       with:
         name: gonet-top-windows-amd64
         path: gonet-top.exe
+
+    - name: Create Release
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: gonet-top-${{ github.sha }}
+        files: gonet-top.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
