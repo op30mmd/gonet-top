@@ -5,10 +5,12 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,12 +29,27 @@ func isAdmin() bool {
 
 // --- ETW and Data Structures ---
 
-const networkProviderGUID = "{7DD42A49-5329-4832-8DFD-43D979153A88}"
+// Try multiple network providers
+var networkProviders = []string{
+	"{7DD42A49-5329-4832-8DFD-43D979153A88}", // Microsoft-Windows-Kernel-Network
+	"{2F07E2EE-15DB-40F1-90EF-9D7BA282188A}", // Microsoft-Windows-TCPIP
+	"{43D1A55C-76D6-4F7E-995C-64C711E5CAFE}", // Microsoft-Windows-WinINet
+}
+
 const (
+	// TCP opcodes
 	opcodeTCPSend    = 10
 	opcodeTCPReceive = 11
+	opcodeTCPConnect = 12
+	opcodeTCPDisconnect = 13
+	
+	// UDP opcodes  
 	opcodeUDPSend    = 42
 	opcodeUDPReceive = 43
+	
+	// Alternative opcodes that might be used
+	opcodeNetworkSend = 26
+	opcodeNetworkRecv = 27
 )
 
 type ProcessNetStats struct {
@@ -329,14 +346,39 @@ func startProcessNameWatcher() {
 // --- Main and ETW Logic ---
 
 func main() {
-	// Setup logging to a file for debugging in CI.
-	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
-		os.Exit(1)
+	// Command line flags
+	debugMode := flag.Bool("debug", false, "Enable debug mode (logs to console instead of running TUI)")
+	flag.Parse()
+	
+	// Check if we're in CI environment
+	isCI := os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != ""
+	
+	// Setup logging
+	var logFile *os.File
+	var err error
+	
+	if isCI {
+		// In CI, log to file for debugging
+		logFile, err = os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
+			os.Exit(1)
+		}
+		defer logFile.Close()
+		log.SetOutput(logFile)
+	} else if *debugMode {
+		// In debug mode, log to both console and file
+		logFile, err = os.OpenFile("debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open debug log file: %v\n", err)
+			os.Exit(1)
+		}
+		defer logFile.Close()
+		log.SetOutput(os.Stdout) // Log to console in debug mode
+	} else {
+		// In normal environment, log to stderr so it's visible if needed
+		log.SetOutput(os.Stderr)
 	}
-	defer logFile.Close()
-	log.SetOutput(logFile)
 	
 	log.Println("Starting gonet-top...")
 
@@ -349,15 +391,45 @@ func main() {
 	
 	log.Println("Admin check passed")
 
-	// Setup TUI output to a different file for CI testing.
-	tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err != nil {
-		log.Fatalf("Failed to open TUI log file: %v", err)
+	if *debugMode {
+		fmt.Println("Debug mode enabled - ETW events will be logged to console")
+		fmt.Println("Press Ctrl+C to exit")
+		
+		// In debug mode, just run the ETW consumer and log events
+		go startEtwConsumer()
+		go startProcessNameWatcher()
+		
+		// Keep the program running and periodically show stats
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ticker.C:
+				showDebugStats()
+			}
+		}
 	}
-	defer tuiLogFile.Close()
 
-	log.Println("Starting Bubble Tea program...")
-	p := tea.NewProgram(initialModel(), tea.WithOutput(tuiLogFile), tea.WithAltScreen())
+	var p *tea.Program
+	
+	if isCI {
+		// In CI, output TUI to file for testing
+		tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+		if err != nil {
+			log.Fatalf("Failed to open TUI log file: %v", err)
+		}
+		defer tuiLogFile.Close()
+		log.Println("Starting Bubble Tea program (CI mode)...")
+		p = tea.NewProgram(initialModel(), tea.WithOutput(tuiLogFile), tea.WithAltScreen())
+	} else {
+		// In normal environment, use standard terminal
+		fmt.Println("Starting gonet-top... (Run with -debug flag to see ETW logs)")
+		time.Sleep(2 * time.Second) // Give user time to read the message
+		log.Println("Starting Bubble Tea program (interactive mode)...")
+		p = tea.NewProgram(initialModel(), tea.WithAltScreen())
+	}
+	
 	if _, err := p.Run(); err != nil {
 		log.Fatalf("Alas, there's been an error: %v", err)
 	}
@@ -369,12 +441,23 @@ func startEtwConsumer() {
 	s := etw.NewRealTimeSession("gonet-top-session")
 	defer s.Stop()
 	
-	if err := s.EnableProvider(etw.MustParseProvider(networkProviderGUID)); err != nil {
-		log.Printf("Failed to enable provider: %s", err)
+	// Try enabling multiple providers
+	providersEnabled := 0
+	for i, providerGUID := range networkProviders {
+		if err := s.EnableProvider(etw.MustParseProvider(providerGUID)); err != nil {
+			log.Printf("Failed to enable provider %d (%s): %s", i+1, providerGUID, err)
+		} else {
+			log.Printf("Successfully enabled provider %d (%s)", i+1, providerGUID)
+			providersEnabled++
+		}
+	}
+	
+	if providersEnabled == 0 {
+		log.Printf("Failed to enable any ETW providers!")
 		return
 	}
 	
-	log.Println("ETW provider enabled successfully")
+	log.Printf("Enabled %d out of %d ETW providers", providersEnabled, len(networkProviders))
 	
 	c := etw.NewRealTimeConsumer(context.Background())
 	defer c.Stop()
@@ -384,60 +467,126 @@ func startEtwConsumer() {
 	// Start event processing goroutine
 	go func() {
 		eventCount := 0
+		unknownOpcodes := make(map[uint8]int)
+		fieldNames := make(map[string]int)
+		
 		log.Println("Starting to process ETW events...")
 		
 		for e := range c.Events {
 			eventCount++
+			
+			// Log first few events completely for debugging
+			if eventCount <= 20 {
+				log.Printf("Event #%d - Provider: %s, Opcode: %d, EventData: %+v", 
+					eventCount, e.System.Provider.Guid, e.System.Opcode.Value, e.EventData)
+			}
+			
+			// Track all field names we see
+			for fieldName := range e.EventData {
+				fieldNames[fieldName]++
+			}
+			
+			// Log field names summary every 100 events
 			if eventCount%100 == 0 {
-				log.Printf("Processed %d events", eventCount)
+				log.Printf("Processed %d events. Field names seen: %+v", eventCount, fieldNames)
 			}
 			
 			opcode := e.System.Opcode.Value
-			isSend := opcode == opcodeTCPSend || opcode == opcodeUDPSend
-			isRecv := opcode == opcodeTCPReceive || opcode == opcodeUDPReceive
+			
+			// Track unknown opcodes
+			unknownOpcodes[opcode]++
+			if eventCount%100 == 0 {
+				log.Printf("Opcode frequency: %+v", unknownOpcodes)
+			}
+			
+			// Check for network-related opcodes (be more permissive)
+			isSend := opcode == opcodeTCPSend || opcode == opcodeUDPSend || opcode == opcodeNetworkSend
+			isRecv := opcode == opcodeTCPReceive || opcode == opcodeUDPReceive || opcode == opcodeNetworkRecv
+			
+			// Also try to detect based on event data field names
+			if !isSend && !isRecv {
+				// Look for common network-related field patterns
+				hasNetworkFields := false
+				for fieldName := range e.EventData {
+					lowerField := strings.ToLower(fieldName)
+					if strings.Contains(lowerField, "size") || 
+					   strings.Contains(lowerField, "length") || 
+					   strings.Contains(lowerField, "bytes") ||
+					   strings.Contains(lowerField, "data") {
+						hasNetworkFields = true
+						break
+					}
+				}
+				
+				if hasNetworkFields {
+					// Assume it's network traffic, try to determine direction from field names or opcode
+					if opcode%2 == 0 {
+						isSend = true
+					} else {
+						isRecv = true
+					}
+				}
+			}
 			
 			if !isSend && !isRecv {
 				continue
 			}
 			
-			// Try different field names for PID
+			// Try multiple field names for PID
 			var pid uint32
 			var pidOk bool
 			
-			if p, ok := e.EventData["PID"].(uint32); ok {
-				pid, pidOk = p, true
-			} else if p, ok := e.EventData["ProcessId"].(uint32); ok {
-				pid, pidOk = p, true
-			} else if p, ok := e.EventData["pid"].(uint32); ok {
-				pid, pidOk = p, true
+			for _, pidField := range []string{"PID", "ProcessId", "pid", "ProcessID", "Pid"} {
+				if p, ok := e.EventData[pidField]; ok {
+					switch v := p.(type) {
+					case uint32:
+						pid, pidOk = v, true
+					case int32:
+						pid, pidOk = uint32(v), true
+					case uint64:
+						pid, pidOk = uint32(v), true
+					case int64:
+						pid, pidOk = uint32(v), true
+					}
+					if pidOk {
+						break
+					}
+				}
 			}
 			
-			// Try different field names for size
-			var size32 uint32
+			// Try multiple field names for size
+			var size64 uint64
 			var sizeOk bool
 			
-			if s, ok := e.EventData["size"].(uint32); ok {
-				size32, sizeOk = s, true
-			} else if s, ok := e.EventData["Size"].(uint32); ok {
-				size32, sizeOk = s, true
-			} else if s, ok := e.EventData["DataLength"].(uint32); ok {
-				size32, sizeOk = s, true
-			} else if s, ok := e.EventData["Length"].(uint32); ok {
-				size32, sizeOk = s, true
+			for _, sizeField := range []string{"size", "Size", "DataLength", "Length", "ByteCount", "Bytes", "PacketSize"} {
+				if s, ok := e.EventData[sizeField]; ok {
+					switch v := s.(type) {
+					case uint32:
+						size64, sizeOk = uint64(v), true
+					case int32:
+						size64, sizeOk = uint64(v), true
+					case uint64:
+						size64, sizeOk = v, true
+					case int64:
+						size64, sizeOk = uint64(v), true
+					}
+					if sizeOk {
+						break
+					}
+				}
 			}
 			
 			if !pidOk || !sizeOk {
-				if eventCount <= 10 {
-					log.Printf("Event data fields: %+v", e.EventData)
+				if eventCount <= 50 {
+					log.Printf("Missing fields - PID found: %t, Size found: %t", pidOk, sizeOk)
 				}
 				continue
 			}
 			
-			if eventCount <= 5 {
-				log.Printf("Processing event: PID=%d, Size=%d, Opcode=%d, IsSend=%t", pid, size32, opcode, isSend)
+			if eventCount <= 10 {
+				log.Printf("Processing network event: PID=%d, Size=%d, Opcode=%d, IsSend=%t", 
+					pid, size64, opcode, isSend)
 			}
-			
-			size := uint64(size32)
 			
 			statsMap.Lock()
 			stats, ok := statsMap.m[pid]
@@ -450,15 +599,15 @@ func startEtwConsumer() {
 			}
 			
 			if isSend {
-				stats.SentBytes += size
+				stats.SentBytes += size64
 			} else if isRecv {
-				stats.RecvBytes += size
+				stats.RecvBytes += size64
 			}
 			stats.UpdatedAt = time.Now()
 			statsMap.Unlock()
 		}
 		
-		log.Println("ETW event processing stopped")
+		log.Printf("ETW event processing stopped after %d events", eventCount)
 	}()
 	
 	// Start the consumer
