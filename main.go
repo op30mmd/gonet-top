@@ -1717,5 +1717,4 @@ func main() {
     }
     if _, err := p.Run(); err != nil {
         log.Fatalf("Error running program: %v",
-    }
 }
