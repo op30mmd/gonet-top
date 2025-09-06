@@ -208,6 +208,7 @@ type model struct {
     pendingSortTime time.Time
     width          int // Terminal width
     height         int // Terminal height
+    lockedProcess  int // -1 means not locked, otherwise the PID of the locked process
     // Goroutine control
     nameWatcherDone   chan struct{}
     startTimeWatcherDone chan struct{}
@@ -226,6 +227,7 @@ func initialModel() model {
         pendingSort:    -1, // No pending sort
         width:          80,  // Default width
         height:         24,  // Default height
+        lockedProcess:  -1, // Not locked
         nameWatcherDone: make(chan struct{}),
         startTimeWatcherDone: make(chan struct{}),
     }
@@ -284,28 +286,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 }
                 return m, nil
             }
-        case "enter":
+        case "enter", " ", "d":
             if m.showSettings {
                 // Exit settings mode
                 m.showSettings = false
             } else {
-                m.showDetails = !m.showDetails
-            }
-        case " ":
-            if m.showSettings {
-                // Exit settings mode
-                m.showSettings = false
-            } else {
-                m.showDetails = !m.showDetails
+                // Only show details in detailed view
+                if m.viewMode == 1 {
+                    m.showDetails = !m.showDetails
+                } else {
+                    // Switch to detailed view and show details
+                    m.viewMode = 1
+                    m.showDetails = true
+                }
             }
         case "tab":
             m.viewMode = (m.viewMode + 1) % 3
-        case "d":
-            if m.showSettings {
-                // Exit settings mode
-                m.showSettings = false
+        case "L": // Shift+L for lock
+            if m.lockedProcess == -1 {
+                // Lock on the current process
+                if len(m.processes) > 0 && m.selectedIdx < len(m.processes) {
+                    m.lockedProcess = int(m.processes[m.selectedIdx].PID)
+                    m.viewMode = 1 // Switch to detailed view
+                    m.showDetails = true
+                }
             } else {
-                m.showDetails = !m.showDetails
+                // Unlock
+                m.lockedProcess = -1
             }
         case "s":
             // Cancel any existing pending sort
@@ -341,13 +348,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         m.processes = msg.processes
         // Don't update m.sortBy from the message, keep the current model value
         m.lastUpdate = time.Now()
-        // Keep selection in bounds with proper checks
-        if len(m.processes) == 0 {
+        
+        // If we have a locked process, filter the processes list
+        if m.lockedProcess != -1 {
+            var filteredProcesses []ProcessDisplayInfo
+            for _, p := range m.processes {
+                if int(p.PID) == m.lockedProcess {
+                    filteredProcesses = append(filteredProcesses, p)
+                    break
+                }
+            }
+            m.processes = filteredProcesses
+            // Set selected index to 0 since there's only one process
             m.selectedIdx = 0
-        } else if oldSelected >= len(m.processes) {
-            m.selectedIdx = len(m.processes) - 1
         } else {
-            m.selectedIdx = oldSelected
+            // Keep selection in bounds with proper checks
+            if len(m.processes) == 0 {
+                m.selectedIdx = 0
+            } else if oldSelected >= len(m.processes) {
+                m.selectedIdx = len(m.processes) - 1
+            } else {
+                m.selectedIdx = oldSelected
+            }
         }
         return m, tickWithSortAndDelay(m.sortBy, m.refreshDelay)
     }
@@ -361,6 +383,11 @@ func (m model) View() string {
     doc.WriteString(fmt.Sprintf("gonet-top - Enhanced Network Monitor | Mode: %s | Sort: %s\n", m.getViewModeName(), m.getSortModeName()))
     doc.WriteString(fmt.Sprintf("Last updated: %s | Active processes: %d | Selected: %d\n\n", 
         m.lastUpdate.Format("15:04:05"), len(m.processes), m.selectedIdx+1))
+    
+    // Show lock status if locked
+    if m.lockedProcess != -1 {
+        doc.WriteString(fmt.Sprintf("🔒 LOCKED on PID %d\n\n", m.lockedProcess))
+    }
     
     // Show pending sort indicator if there's a pending sort
     if m.pendingSort >= 0 {
@@ -376,7 +403,7 @@ func (m model) View() string {
         doc.WriteString("Settings Mode - Refresh: ↑/↓=adjust, Sort Delay: ←/→=adjust, Enter=exit\n\n")
         doc.WriteString(fmt.Sprintf("Current refresh delay: %v | Current sort delay: %v\n\n", m.refreshDelay, m.sortDelay))
     } else {
-        doc.WriteString("Controls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, r=settings, q=quit\n\n")
+        doc.WriteString("Controls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, L=lock, r=settings, q=quit\n\n")
     }
     
     if len(m.processes) == 0 {
@@ -580,8 +607,8 @@ func (m model) renderDetailedView() string {
         doc.WriteString(row + "\n")
     }
     
-    // Show details for selected process
-    if m.showDetails && m.selectedIdx < len(m.processes) {
+    // Show details for selected process only in detailed view
+    if m.viewMode == 1 && m.showDetails && m.selectedIdx < len(m.processes) {
         selected := m.processes[m.selectedIdx]
         doc.WriteString("\n")
         detailStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1).MarginTop(1)
@@ -1566,6 +1593,7 @@ func main() {
         fmt.Println("- Press 'r' to adjust refresh and sort delay settings")
         fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
         fmt.Println("- Press Enter or 'd' to toggle process details")
+        fmt.Println("- Press 'L' to lock/unlock on a process")
         fmt.Println("\nStarting in 3 seconds...")
         time.Sleep(3 * time.Second)
         log.Println("Starting Enhanced Bubble Tea program (interactive mode)...")
