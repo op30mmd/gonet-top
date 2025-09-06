@@ -4,21 +4,63 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"sort"
-	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 
-	"github.com/0xrawsec/golang-etw/etw"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mitchellh/go-ps"
 )
+
+// --- Windows API declarations ---
+
+var (
+	kernel32 = syscall.NewLazyDLL("kernel32.dll")
+	iphlpapi = syscall.NewLazyDLL("iphlpapi.dll")
+
+	procGetProcessMemoryInfo = kernel32.NewProc("K32GetProcessMemoryInfo")
+	procGetTcpTable2         = iphlpapi.NewProc("GetTcpTable2")
+	procGetUdpTable          = iphlpapi.NewProc("GetUdpTable")
+)
+
+// TCP_TABLE_OWNER_PID_ALL constant
+const TCP_TABLE_OWNER_PID_ALL = 5
+const UDP_TABLE_OWNER_PID = 1
+
+// MIB_TCPROW2 structure
+type MIB_TCPROW2 struct {
+	State      uint32
+	LocalAddr  uint32
+	LocalPort  uint32
+	RemoteAddr uint32
+	RemotePort uint32
+	OwningPid  uint32
+	OffloadState uint32
+}
+
+type MIB_TCPTABLE2 struct {
+	NumEntries uint32
+	Table      [1]MIB_TCPROW2
+}
+
+// MIB_UDPROW_OWNER_PID structure
+type MIB_UDPROW_OWNER_PID struct {
+	LocalAddr uint32
+	LocalPort uint32
+	OwningPid uint32
+}
+
+type MIB_UDPTABLE_OWNER_PID struct {
+	NumEntries uint32
+	Table      [1]MIB_UDPROW_OWNER_PID
+}
 
 // --- Admin Check ---
 
@@ -27,38 +69,14 @@ func isAdmin() bool {
 	return err == nil
 }
 
-// --- ETW and Data Structures ---
-
-// Try multiple network providers
-var networkProviders = []string{
-	"{7DD42A49-5329-4832-8DFD-43D979153A88}", // Microsoft-Windows-Kernel-Network
-	"{2F07E2EE-15DB-40F1-90EF-9D7BA282188A}", // Microsoft-Windows-TCPIP
-	"{43D1A55C-76D6-4F7E-995C-64C711E5CAFE}", // Microsoft-Windows-WinINet
-}
-
-const (
-	// TCP opcodes
-	opcodeTCPSend    = 10
-	opcodeTCPReceive = 11
-	opcodeTCPConnect = 12
-	opcodeTCPDisconnect = 13
-	
-	// UDP opcodes  
-	opcodeUDPSend    = 42
-	opcodeUDPReceive = 43
-	
-	// Alternative opcodes that might be used
-	opcodeNetworkSend = 26
-	opcodeNetworkRecv = 27
-)
+// --- Data Structures ---
 
 type ProcessNetStats struct {
-	PID       uint32
-	SentBytes uint64
-	RecvBytes uint64
-	LastSent  uint64
-	LastRecv  uint64
-	UpdatedAt time.Time
+	PID         uint32
+	ProcessName string
+	TCPConns    uint32
+	UDPConns    uint32
+	LastUpdate  time.Time
 }
 
 var statsMap = struct {
@@ -76,16 +94,15 @@ var pidNameCache = struct {
 type ProcessDisplayInfo struct {
 	PID         uint32
 	ProcessName string
-	SendSpeed   string
-	RecvSpeed   string
-	TotalSent   uint64
-	TotalRecv   uint64
+	TCPConns    uint32
+	UDPConns    uint32
+	TotalConns  uint32
 }
 
 type statsUpdatedMsg []ProcessDisplayInfo
 
 type model struct {
-	processes []ProcessDisplayInfo
+	processes  []ProcessDisplayInfo
 	lastUpdate time.Time
 }
 
@@ -96,7 +113,7 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	go startEtwConsumer()
+	go startNetworkMonitor()
 	go startProcessNameWatcher()
 	return tick()
 }
@@ -117,42 +134,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	doc := "gonet-top - Network Usage by Process\n"
+	doc := "gonet-top - Network Connections by Process\n"
 	doc += fmt.Sprintf("Last updated: %s\n", m.lastUpdate.Format("15:04:05"))
 	doc += fmt.Sprintf("Active processes: %d\n\n", len(m.processes))
-	
+
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
 	cellStyle := lipgloss.NewStyle().Padding(0, 1)
-	
-	headers := []string{"PID", "Process Name", "Send Rate", "Recv Rate", "Total Sent", "Total Recv"}
+
+	headers := []string{"PID", "Process Name", "TCP Conns", "UDP Conns", "Total"}
 	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
 		headerStyle.Copy().Width(8).Render(headers[0]),
-		headerStyle.Copy().Width(20).Render(headers[1]),
+		headerStyle.Copy().Width(25).Render(headers[1]),
 		headerStyle.Copy().Width(12).Render(headers[2]),
 		headerStyle.Copy().Width(12).Render(headers[3]),
 		headerStyle.Copy().Width(12).Render(headers[4]),
-		headerStyle.Copy().Width(12).Render(headers[5]),
 	)
 	doc += headerRow + "\n"
-	
+
 	if len(m.processes) == 0 {
-		doc += "No network activity detected yet...\n"
-		doc += "Try browsing the web or downloading a file to see data.\n"
+		doc += "No network connections detected...\n"
+		doc += "Try browsing the web or starting network applications.\n"
 	} else {
 		for _, p := range m.processes {
-			pidStr := fmt.Sprintf("%d", p.PID)
 			row := lipgloss.JoinHorizontal(lipgloss.Left,
-				cellStyle.Copy().Width(8).Render(pidStr),
-				cellStyle.Copy().Width(20).Render(truncateString(p.ProcessName, 18)),
-				cellStyle.Copy().Width(12).Render(p.SendSpeed),
-				cellStyle.Copy().Width(12).Render(p.RecvSpeed),
-				cellStyle.Copy().Width(12).Render(formatBytes(p.TotalSent)),
-				cellStyle.Copy().Width(12).Render(formatBytes(p.TotalRecv)),
+				cellStyle.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
+				cellStyle.Copy().Width(25).Render(truncateString(p.ProcessName, 23)),
+				cellStyle.Copy().Width(12).Render(fmt.Sprintf("%d", p.TCPConns)),
+				cellStyle.Copy().Width(12).Render(fmt.Sprintf("%d", p.UDPConns)),
+				cellStyle.Copy().Width(12).Render(fmt.Sprintf("%d", p.TotalConns)),
 			)
 			doc += row + "\n"
 		}
 	}
-	
+
 	doc += "\n\nPress 'q' or 'ctrl+c' to quit."
 	return doc
 }
@@ -164,146 +178,196 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
-// --- Ticker and Data Calculation ---
+// --- Ticker ---
 
 func tick() tea.Cmd {
-	return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
-		return calculateRates()
+	return tea.Tick(time.Second*3, func(t time.Time) tea.Msg {
+		return getNetworkStats()
 	})
 }
 
-func calculateRates() statsUpdatedMsg {
-	now := time.Now()
-	
-	statsMap.Lock()
-	currentStats := make(map[uint32]*ProcessNetStats)
-	for pid, stats := range statsMap.m {
-		// Copy the stats to avoid data races
-		currentStats[pid] = &ProcessNetStats{
-			PID:       stats.PID,
-			SentBytes: stats.SentBytes,
-			RecvBytes: stats.RecvBytes,
-			LastSent:  stats.LastSent,
-			LastRecv:  stats.LastRecv,
-			UpdatedAt: stats.UpdatedAt,
-		}
+// --- Network Connection Monitoring ---
+
+func getTcpConnections() (map[uint32]uint32, error) {
+	connections := make(map[uint32]uint32)
+
+	// Get buffer size
+	var bufSize uint32
+	ret, _, _ := procGetTcpTable2.Call(0, uintptr(unsafe.Pointer(&bufSize)), 0, TCP_TABLE_OWNER_PID_ALL)
+
+	if ret != 122 { // ERROR_INSUFFICIENT_BUFFER
+		return nil, fmt.Errorf("failed to get TCP table size: %d", ret)
 	}
-	statsMap.Unlock()
-	
+
+	// Allocate buffer
+	buf := make([]byte, bufSize)
+	ret, _, _ = procGetTcpTable2.Call(
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&bufSize)),
+		0,
+		TCP_TABLE_OWNER_PID_ALL,
+	)
+
+	if ret != 0 {
+		return nil, fmt.Errorf("failed to get TCP table: %d", ret)
+	}
+
+	// Parse table
+	table := (*MIB_TCPTABLE2)(unsafe.Pointer(&buf[0]))
+	tableSlice := (*[1024 * 1024]MIB_TCPROW2)(unsafe.Pointer(&table.Table[0]))[:table.NumEntries:table.NumEntries]
+
+	for _, row := range tableSlice {
+		connections[row.OwningPid]++
+	}
+
+	return connections, nil
+}
+
+func getUdpConnections() (map[uint32]uint32, error) {
+	connections := make(map[uint32]uint32)
+
+	// Get buffer size
+	var bufSize uint32
+	ret, _, _ := procGetUdpTable.Call(0, uintptr(unsafe.Pointer(&bufSize)), 0, UDP_TABLE_OWNER_PID)
+
+	if ret != 122 { // ERROR_INSUFFICIENT_BUFFER
+		return nil, fmt.Errorf("failed to get UDP table size: %d", ret)
+	}
+
+	// Allocate buffer
+	buf := make([]byte, bufSize)
+	ret, _, _ = procGetUdpTable.Call(
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&bufSize)),
+		0,
+		UDP_TABLE_OWNER_PID,
+	)
+
+	if ret != 0 {
+		return nil, fmt.Errorf("failed to get UDP table: %d", ret)
+	}
+
+	// Parse table
+	table := (*MIB_UDPTABLE_OWNER_PID)(unsafe.Pointer(&buf[0]))
+	tableSlice := (*[1024 * 1024]MIB_UDPROW_OWNER_PID)(unsafe.Pointer(&table.Table[0]))[:table.NumEntries:table.NumEntries]
+
+	for _, row := range tableSlice {
+		connections[row.OwningPid]++
+	}
+
+	return connections, nil
+}
+
+func getNetworkStats() statsUpdatedMsg {
+	tcpConns, err := getTcpConnections()
+	if err != nil {
+		log.Printf("Error getting TCP connections: %v", err)
+		tcpConns = make(map[uint32]uint32)
+	}
+
+	udpConns, err := getUdpConnections()
+	if err != nil {
+		log.Printf("Error getting UDP connections: %v", err)
+		udpConns = make(map[uint32]uint32)
+	}
+
+	// Combine all PIDs
+	allPids := make(map[uint32]bool)
+	for pid := range tcpConns {
+		allPids[pid] = true
+	}
+	for pid := range udpConns {
+		allPids[pid] = true
+	}
+
 	pidNameCache.RLock()
 	defer pidNameCache.RUnlock()
-	
+
 	var displayInfos []ProcessDisplayInfo
-	
-	for pid, stats := range currentStats {
-		// Skip processes with no activity
-		if stats.SentBytes == 0 && stats.RecvBytes == 0 {
+
+	for pid := range allPids {
+		tcpCount := tcpConns[pid]
+		udpCount := udpConns[pid]
+		totalCount := tcpCount + udpCount
+
+		// Skip processes with no connections
+		if totalCount == 0 {
 			continue
 		}
-		
-		// Calculate rates based on time difference
-		timeDiff := now.Sub(stats.UpdatedAt).Seconds()
-		if timeDiff <= 0 {
-			timeDiff = 1
-		}
-		
-		sendRate := float64(stats.SentBytes-stats.LastSent) / timeDiff
-		recvRate := float64(stats.RecvBytes-stats.LastRecv) / timeDiff
-		
-		// Update last values for next calculation
-		statsMap.Lock()
-		if s, exists := statsMap.m[pid]; exists {
-			s.LastSent = stats.SentBytes
-			s.LastRecv = stats.RecvBytes
-			s.UpdatedAt = now
-		}
-		statsMap.Unlock()
-		
+
 		name, ok := pidNameCache.m[pid]
 		if !ok {
 			name = fmt.Sprintf("PID-%d", pid)
 		}
-		
+
 		displayInfos = append(displayInfos, ProcessDisplayInfo{
 			PID:         pid,
 			ProcessName: name,
-			SendSpeed:   formatSpeed(uint64(sendRate)),
-			RecvSpeed:   formatSpeed(uint64(recvRate)),
-			TotalSent:   stats.SentBytes,
-			TotalRecv:   stats.RecvBytes,
+			TCPConns:    tcpCount,
+			UDPConns:    udpCount,
+			TotalConns:  totalCount,
 		})
 	}
-	
-	// Sort by total bytes (sent + received) descending
+
+	// Sort by total connections descending
 	sort.Slice(displayInfos, func(i, j int) bool {
-		totalI := displayInfos[i].TotalSent + displayInfos[i].TotalRecv
-		totalJ := displayInfos[j].TotalSent + displayInfos[j].TotalRecv
-		return totalI > totalJ
+		return displayInfos[i].TotalConns > displayInfos[j].TotalConns
 	})
-	
-	// Limit to top 20 processes to avoid clutter
+
+	// Limit to top 20 processes
 	if len(displayInfos) > 20 {
 		displayInfos = displayInfos[:20]
 	}
-	
+
 	return statsUpdatedMsg(displayInfos)
-}
-
-func formatSpeed(bytes uint64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B/s", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB/s", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-func formatBytes(bytes uint64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 // --- Debug Functions ---
 
 func showDebugStats() {
-	statsMap.RLock()
-	defer statsMap.RUnlock()
-	
-	pidNameCache.RLock()
-	defer pidNameCache.RUnlock()
-	
-	fmt.Println("\n=== Current Network Stats ===")
-	fmt.Printf("Tracked processes: %d\n", len(statsMap.m))
-	
-	if len(statsMap.m) == 0 {
-		fmt.Println("No network activity detected")
+	tcpConns, err := getTcpConnections()
+	if err != nil {
+		fmt.Printf("Error getting TCP connections: %v\n", err)
 		return
 	}
-	
-	for pid, stats := range statsMap.m {
+
+	udpConns, err := getUdpConnections()
+	if err != nil {
+		fmt.Printf("Error getting UDP connections: %v\n", err)
+		return
+	}
+
+	pidNameCache.RLock()
+	defer pidNameCache.RUnlock()
+
+	fmt.Println("\n=== Current Network Connections ===")
+
+	// Combine all PIDs
+	allPids := make(map[uint32]bool)
+	for pid := range tcpConns {
+		allPids[pid] = true
+	}
+	for pid := range udpConns {
+		allPids[pid] = true
+	}
+
+	if len(allPids) == 0 {
+		fmt.Println("No network connections detected")
+		return
+	}
+
+	for pid := range allPids {
 		name, ok := pidNameCache.m[pid]
 		if !ok {
 			name = fmt.Sprintf("PID-%d", pid)
 		}
-		
-		fmt.Printf("PID %d (%s): Sent=%s, Recv=%s\n", 
-			pid, name, 
-			formatBytes(stats.SentBytes), 
-			formatBytes(stats.RecvBytes))
+
+		tcpCount := tcpConns[pid]
+		udpCount := udpConns[pid]
+		fmt.Printf("PID %d (%s): TCP=%d, UDP=%d, Total=%d\n",
+			pid, name, tcpCount, udpCount, tcpCount+udpCount)
 	}
-	fmt.Println("=============================")
+	fmt.Println("===================================")
 }
 
 // --- Process Name Discovery ---
@@ -332,31 +396,44 @@ func startProcessNameWatcher() {
 		pidNameCache.Unlock()
 		log.Printf("Updated process names cache with %d processes", len(names))
 	}
-	
+
 	update() // Initial update
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	
+
 	for {
 		<-ticker.C
 		update()
 	}
 }
 
-// --- Main and ETW Logic ---
+func startNetworkMonitor() {
+	log.Println("Starting network connection monitor...")
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+		// The actual monitoring happens in getNetworkStats()
+		// which is called by the tick() function
+	}
+}
+
+// --- Main ---
 
 func main() {
 	// Command line flags
 	debugMode := flag.Bool("debug", false, "Enable debug mode (logs to console instead of running TUI)")
 	flag.Parse()
-	
+
 	// Check if we're in CI environment
 	isCI := os.Getenv("CI") != "" || os.Getenv("GITHUB_ACTIONS") != ""
-	
+
 	// Setup logging
 	var logFile *os.File
 	var err error
-	
+
 	if isCI {
 		// In CI, log to file for debugging
 		logFile, err = os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
@@ -367,42 +444,33 @@ func main() {
 		defer logFile.Close()
 		log.SetOutput(logFile)
 	} else if *debugMode {
-		// In debug mode, log to both console and file
-		logFile, err = os.OpenFile("debug.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to open debug log file: %v\n", err)
-			os.Exit(1)
-		}
-		defer logFile.Close()
-		log.SetOutput(os.Stdout) // Log to console in debug mode
+		// In debug mode, log to console
+		log.SetOutput(os.Stdout)
 	} else {
-		// In normal environment, log to stderr so it's visible if needed
+		// In normal environment, log to stderr
 		log.SetOutput(os.Stderr)
 	}
-	
-	log.Println("Starting gonet-top...")
+
+	log.Println("Starting gonet-top (Performance Counter version)...")
 
 	if !isAdmin() {
-		log.Println("Error: Administrator privileges are required.")
-		fmt.Println("Error: Administrator privileges are required.")
-		fmt.Println("Please restart the application from a terminal with 'Run as administrator'.")
-		return
+		log.Println("Note: Some network information may be limited without administrator privileges.")
+		fmt.Println("Note: Running without administrator privileges.")
+		fmt.Println("Some network information may be limited. For full functionality, run as administrator.")
+	} else {
+		log.Println("Admin check passed")
 	}
-	
-	log.Println("Admin check passed")
 
 	if *debugMode {
-		fmt.Println("Debug mode enabled - ETW events will be logged to console")
+		fmt.Println("Debug mode enabled - Network connections will be logged to console")
 		fmt.Println("Press Ctrl+C to exit")
-		
-		// In debug mode, just run the ETW consumer and log events
-		go startEtwConsumer()
+
+		// In debug mode, just show network stats periodically
 		go startProcessNameWatcher()
-		
-		// Keep the program running and periodically show stats
-		ticker := time.NewTicker(5 * time.Second)
+
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ticker.C:
@@ -412,7 +480,7 @@ func main() {
 	}
 
 	var p *tea.Program
-	
+
 	if isCI {
 		// In CI, output TUI to file for testing
 		tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
@@ -424,196 +492,13 @@ func main() {
 		p = tea.NewProgram(initialModel(), tea.WithOutput(tuiLogFile), tea.WithAltScreen())
 	} else {
 		// In normal environment, use standard terminal
-		fmt.Println("Starting gonet-top... (Run with -debug flag to see ETW logs)")
-		time.Sleep(2 * time.Second) // Give user time to read the message
+		fmt.Println("Starting gonet-top... (Run with -debug flag to see connection logs)")
+		time.Sleep(2 * time.Second)
 		log.Println("Starting Bubble Tea program (interactive mode)...")
 		p = tea.NewProgram(initialModel(), tea.WithAltScreen())
 	}
-	
-	if _, err := p.Run(); err != nil {
-		log.Fatalf("Alas, there's been an error: %v", err)
-	}
-}
 
-func startEtwConsumer() {
-	log.Println("Starting ETW consumer...")
-	
-	s := etw.NewRealTimeSession("gonet-top-session")
-	defer s.Stop()
-	
-	// Try enabling multiple providers
-	providersEnabled := 0
-	for i, providerGUID := range networkProviders {
-		if err := s.EnableProvider(etw.MustParseProvider(providerGUID)); err != nil {
-			log.Printf("Failed to enable provider %d (%s): %s", i+1, providerGUID, err)
-		} else {
-			log.Printf("Successfully enabled provider %d (%s)", i+1, providerGUID)
-			providersEnabled++
-		}
-	}
-	
-	if providersEnabled == 0 {
-		log.Printf("Failed to enable any ETW providers!")
-		return
-	}
-	
-	log.Printf("Enabled %d out of %d ETW providers", providersEnabled, len(networkProviders))
-	
-	c := etw.NewRealTimeConsumer(context.Background())
-	defer c.Stop()
-	
-	c.FromSessions(s)
-	
-	// Start event processing goroutine
-	go func() {
-		eventCount := 0
-		unknownOpcodes := make(map[uint8]int)
-		fieldNames := make(map[string]int)
-		
-		log.Println("Starting to process ETW events...")
-		
-		for e := range c.Events {
-			eventCount++
-			
-			// Log first few events completely for debugging
-			if eventCount <= 20 {
-				log.Printf("Event #%d - Provider: %s, Opcode: %d, EventData: %+v", 
-					eventCount, e.System.Provider.Guid, e.System.Opcode.Value, e.EventData)
-			}
-			
-			// Track all field names we see
-			for fieldName := range e.EventData {
-				fieldNames[fieldName]++
-			}
-			
-			// Log field names summary every 100 events
-			if eventCount%100 == 0 {
-				log.Printf("Processed %d events. Field names seen: %+v", eventCount, fieldNames)
-			}
-			
-			opcode := e.System.Opcode.Value
-			
-			// Track unknown opcodes
-			unknownOpcodes[opcode]++
-			if eventCount%100 == 0 {
-				log.Printf("Opcode frequency: %+v", unknownOpcodes)
-			}
-			
-			// Check for network-related opcodes (be more permissive)
-			isSend := opcode == opcodeTCPSend || opcode == opcodeUDPSend || opcode == opcodeNetworkSend
-			isRecv := opcode == opcodeTCPReceive || opcode == opcodeUDPReceive || opcode == opcodeNetworkRecv
-			
-			// Also try to detect based on event data field names
-			if !isSend && !isRecv {
-				// Look for common network-related field patterns
-				hasNetworkFields := false
-				for fieldName := range e.EventData {
-					lowerField := strings.ToLower(fieldName)
-					if strings.Contains(lowerField, "size") || 
-					   strings.Contains(lowerField, "length") || 
-					   strings.Contains(lowerField, "bytes") ||
-					   strings.Contains(lowerField, "data") {
-						hasNetworkFields = true
-						break
-					}
-				}
-				
-				if hasNetworkFields {
-					// Assume it's network traffic, try to determine direction from field names or opcode
-					if opcode%2 == 0 {
-						isSend = true
-					} else {
-						isRecv = true
-					}
-				}
-			}
-			
-			if !isSend && !isRecv {
-				continue
-			}
-			
-			// Try multiple field names for PID
-			var pid uint32
-			var pidOk bool
-			
-			for _, pidField := range []string{"PID", "ProcessId", "pid", "ProcessID", "Pid"} {
-				if p, ok := e.EventData[pidField]; ok {
-					switch v := p.(type) {
-					case uint32:
-						pid, pidOk = v, true
-					case int32:
-						pid, pidOk = uint32(v), true
-					case uint64:
-						pid, pidOk = uint32(v), true
-					case int64:
-						pid, pidOk = uint32(v), true
-					}
-					if pidOk {
-						break
-					}
-				}
-			}
-			
-			// Try multiple field names for size
-			var size64 uint64
-			var sizeOk bool
-			
-			for _, sizeField := range []string{"size", "Size", "DataLength", "Length", "ByteCount", "Bytes", "PacketSize"} {
-				if s, ok := e.EventData[sizeField]; ok {
-					switch v := s.(type) {
-					case uint32:
-						size64, sizeOk = uint64(v), true
-					case int32:
-						size64, sizeOk = uint64(v), true
-					case uint64:
-						size64, sizeOk = v, true
-					case int64:
-						size64, sizeOk = uint64(v), true
-					}
-					if sizeOk {
-						break
-					}
-				}
-			}
-			
-			if !pidOk || !sizeOk {
-				if eventCount <= 50 {
-					log.Printf("Missing fields - PID found: %t, Size found: %t", pidOk, sizeOk)
-				}
-				continue
-			}
-			
-			if eventCount <= 10 {
-				log.Printf("Processing network event: PID=%d, Size=%d, Opcode=%d, IsSend=%t", 
-					pid, size64, opcode, isSend)
-			}
-			
-			statsMap.Lock()
-			stats, ok := statsMap.m[pid]
-			if !ok {
-				stats = &ProcessNetStats{
-					PID:       pid,
-					UpdatedAt: time.Now(),
-				}
-				statsMap.m[pid] = stats
-			}
-			
-			if isSend {
-				stats.SentBytes += size64
-			} else if isRecv {
-				stats.RecvBytes += size64
-			}
-			stats.UpdatedAt = time.Now()
-			statsMap.Unlock()
-		}
-		
-		log.Printf("ETW event processing stopped after %d events", eventCount)
-	}()
-	
-	// Start the consumer
-	if err := c.Start(); err != nil {
-		log.Printf("Error starting consumer: %s", err)
-	} else {
-		log.Println("ETW consumer started successfully")
+	if _, err := p.Run(); err != nil {
+		log.Fatalf("Error running program: %v", err)
 	}
 }
