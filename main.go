@@ -27,6 +27,7 @@ var (
     procGetTcpTable2         = iphlpapi.NewProc("GetTcpTable2")
     procGetUdpTable          = iphlpapi.NewProc("GetUdpTable")
     procGetProcessIoCounters = kernel32.NewProc("GetProcessIoCounters")
+    procGetProcessTimes      = kernel32.NewProc("GetProcessTimes")
 )
 
 // TCP_TABLE_OWNER_PID_ALL constant
@@ -111,6 +112,7 @@ type ProcessNetDetails struct {
     TopRemoteHostConns uint32
     LastRemoteDest     string // Added for last destination tracking
     LastRemoteTime     time.Time // Added for timestamp tracking
+    ProcessStartTime   time.Time // Added for process uptime tracking
     BytesSent          uint64
     BytesReceived      uint64
     LastUpdate         time.Time
@@ -140,6 +142,11 @@ var pidNameCache = struct {
     m map[uint32]string
 }{m: make(map[uint32]string)}
 
+var pidStartTimeCache = struct {
+    sync.RWMutex
+    m map[uint32]time.Time
+}{m: make(map[uint32]time.Time)}
+
 // --- Enhanced Bubble Tea Model ---
 type ProcessDisplayInfo struct {
     PID                uint32
@@ -152,6 +159,7 @@ type ProcessDisplayInfo struct {
     TopRemoteHost      string
     TopRemoteHostConns uint32
     LastRemoteDest     string // Added for last destination display
+    Uptime             string // Added for uptime display
     UploadRate         string // Formatted string
     DownloadRate       string // Formatted string
     TotalBytesSent     string // Formatted string
@@ -201,6 +209,7 @@ func initialModel() model {
 func (m model) Init() tea.Cmd {
     go startNetworkMonitor()
     go startProcessNameWatcher()
+    go startProcessStartTimeWatcher()
     return tickWithSortAndDelay(m.sortBy, m.refreshDelay)
 }
 
@@ -394,16 +403,17 @@ func (m model) renderSummaryView() string {
     headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
     cellStyle := lipgloss.NewStyle().Padding(0, 1)
     selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
-    headers := []string{"PID", "Process Name", "TCP", "UDP", "Total", "Upload", "Download", "Last Destination"}
+    headers := []string{"PID", "Process Name", "TCP", "UDP", "Total", "Uptime", "Upload", "Download", "Last Destination"}
     headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
         headerStyle.Copy().Width(8).Render(headers[0]),
-        headerStyle.Copy().Width(14).Render(headers[1]),
+        headerStyle.Copy().Width(12).Render(headers[1]),
         headerStyle.Copy().Width(6).Render(headers[2]),
         headerStyle.Copy().Width(6).Render(headers[3]),
         headerStyle.Copy().Width(6).Render(headers[4]),
         headerStyle.Copy().Width(10).Render(headers[5]),
-        headerStyle.Copy().Width(10).Render(headers[6]),
-        headerStyle.Copy().Width(20).Render(headers[7]),
+        headerStyle.Copy().Width(8).Render(headers[6]),
+        headerStyle.Copy().Width(8).Render(headers[7]),
+        headerStyle.Copy().Width(16).Render(headers[8]),
     )
     doc.WriteString(headerRow + "\n")
     for i, p := range m.processes {
@@ -418,13 +428,14 @@ func (m model) renderSummaryView() string {
         }
         row := lipgloss.JoinHorizontal(lipgloss.Left,
             style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
-            style.Copy().Width(14).Render(truncateString(p.ProcessName, 12)),
+            style.Copy().Width(12).Render(truncateString(p.ProcessName, 10)),
             style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TCPConns)),
             style.Copy().Width(6).Render(fmt.Sprintf("%d", p.UDPConns)),
             style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TotalConns)),
-            style.Copy().Width(10).Render(p.UploadRate),
-            style.Copy().Width(10).Render(p.DownloadRate),
-            style.Copy().Width(20).Render(truncateString(lastDest, 18)),
+            style.Copy().Width(10).Render(p.Uptime),
+            style.Copy().Width(8).Render(p.UploadRate),
+            style.Copy().Width(8).Render(p.DownloadRate),
+            style.Copy().Width(16).Render(truncateString(lastDest, 14)),
         )
         doc.WriteString(row + "\n")
     }
@@ -437,16 +448,17 @@ func (m model) renderDetailedView() string {
     headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
     cellStyle := lipgloss.NewStyle().Padding(0, 1)
     selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
-    headers := []string{"PID", "Process", "TCP", "UDP", "EST", "Up/s", "Down/s", "Last Dest"}
+    headers := []string{"PID", "Process", "TCP", "UDP", "EST", "Uptime", "Up/s", "Down/s", "Last Dest"}
     headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
         headerStyle.Copy().Width(8).Render(headers[0]),
-        headerStyle.Copy().Width(10).Render(headers[1]),
+        headerStyle.Copy().Width(8).Render(headers[1]),
         headerStyle.Copy().Width(5).Render(headers[2]),
         headerStyle.Copy().Width(5).Render(headers[3]),
         headerStyle.Copy().Width(5).Render(headers[4]),
-        headerStyle.Copy().Width(10).Render(headers[5]),
-        headerStyle.Copy().Width(10).Render(headers[6]),
-        headerStyle.Copy().Width(16).Render(headers[7]),
+        headerStyle.Copy().Width(8).Render(headers[5]),
+        headerStyle.Copy().Width(8).Render(headers[6]),
+        headerStyle.Copy().Width(8).Render(headers[7]),
+        headerStyle.Copy().Width(14).Render(headers[8]),
     )
     doc.WriteString(headerRow + "\n")
     for i, p := range m.processes {
@@ -461,13 +473,14 @@ func (m model) renderDetailedView() string {
         }
         row := lipgloss.JoinHorizontal(lipgloss.Left,
             style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
-            style.Copy().Width(10).Render(truncateString(p.ProcessName, 8)),
+            style.Copy().Width(8).Render(truncateString(p.ProcessName, 6)),
             style.Copy().Width(5).Render(fmt.Sprintf("%d", p.TCPConns)),
             style.Copy().Width(5).Render(fmt.Sprintf("%d", p.UDPConns)),
             style.Copy().Width(5).Render(fmt.Sprintf("%d", p.EstablishedConns)),
-            style.Copy().Width(10).Render(p.UploadRate),
-            style.Copy().Width(10).Render(p.DownloadRate),
-            style.Copy().Width(16).Render(truncateString(lastDest, 14)),
+            style.Copy().Width(8).Render(p.Uptime),
+            style.Copy().Width(8).Render(p.UploadRate),
+            style.Copy().Width(8).Render(p.DownloadRate),
+            style.Copy().Width(14).Render(truncateString(lastDest, 12)),
         )
         doc.WriteString(row + "\n")
     }
@@ -481,6 +494,7 @@ func (m model) renderDetailedView() string {
         details.WriteString(fmt.Sprintf("Process Details: %s (PID %d)\n", selected.ProcessName, selected.PID))
         details.WriteString(fmt.Sprintf("TCP Connections: %d | UDP Connections: %d\n", selected.TCPConns, selected.UDPConns))
         details.WriteString(fmt.Sprintf("Established Connections: %d\n", selected.EstablishedConns))
+        details.WriteString(fmt.Sprintf("Process Uptime: %s\n", selected.Uptime))
         details.WriteString(fmt.Sprintf("Upload Rate: %s/s | Download Rate: %s/s\n", selected.UploadRate, selected.DownloadRate))
         details.WriteString(fmt.Sprintf("Total Bytes Sent: %s | Total Bytes Received: %s\n", 
             selected.TotalBytesSent, selected.TotalBytesReceived))
@@ -509,7 +523,7 @@ func (m model) renderConnectionsView() string {
     titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
     doc.WriteString(titleStyle.Render(fmt.Sprintf("Active Connections for %s (PID %d)", selected.ProcessName, selected.PID)))
     doc.WriteString("\n\n")
-    doc.WriteString(fmt.Sprintf("Upload: %s/s | Download: %s/s\n", selected.UploadRate, selected.DownloadRate))
+    doc.WriteString(fmt.Sprintf("Uptime: %s | Upload: %s/s | Download: %s/s\n", selected.Uptime, selected.UploadRate, selected.DownloadRate))
     doc.WriteString(fmt.Sprintf("Total Sent: %s | Total Received: %s\n", 
         selected.TotalBytesSent, selected.TotalBytesReceived))
     
@@ -578,11 +592,54 @@ func formatBytesPerSecond(bytesPerSec float64) string {
     }
 }
 
+// Format duration to human-readable string
+func formatDuration(d time.Duration) string {
+    if d < time.Minute {
+        return fmt.Sprintf("%.0fs", d.Seconds())
+    } else if d < time.Hour {
+        minutes := int(d.Minutes())
+        seconds := int(d.Seconds()) % 60
+        return fmt.Sprintf("%dm%ds", minutes, seconds)
+    } else if d < 24*time.Hour {
+        hours := int(d.Hours())
+        minutes := int(d.Minutes()) % 60
+        return fmt.Sprintf("%dh%dm", hours, minutes)
+    } else {
+        days := int(d.Hours()) / 24
+        hours := int(d.Hours()) % 24
+        return fmt.Sprintf("%dd%dh", days, hours)
+    }
+}
+
 // --- Ticker with sort and delay parameters ---
 func tickWithSortAndDelay(sortBy int, delay time.Duration) tea.Cmd {
     return tea.Tick(delay, func(t time.Time) tea.Msg {
         return getEnhancedNetworkStats(sortBy)
     })
+}
+
+// --- Get Process Start Time ---
+func getProcessStartTime(pid uint32) (time.Time, error) {
+    handle, err := syscall.OpenProcess(syscall.PROCESS_QUERY_INFORMATION, false, pid)
+    if err != nil {
+        return time.Time{}, err
+    }
+    defer syscall.CloseHandle(handle)
+    
+    var creationTime, exitTime, kernelTime, userTime syscall.Filetime
+    ret, _, _ := procGetProcessTimes.Call(
+        uintptr(handle),
+        uintptr(unsafe.Pointer(&creationTime)),
+        uintptr(unsafe.Pointer(&exitTime)),
+        uintptr(unsafe.Pointer(&kernelTime)),
+        uintptr(unsafe.Pointer(&userTime)),
+    )
+    if ret == 0 {
+        return time.Time{}, fmt.Errorf("GetProcessTimes failed")
+    }
+    
+    // Convert FILETIME to time.Time
+    return time.Unix(0, creationTime.Nanoseconds()), nil
 }
 
 // --- Get Process I/O Counters ---
@@ -639,6 +696,7 @@ func getTcpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
                 Connections: make([]NetworkConnection, 0),
                 LastRemoteDest: "",
                 LastRemoteTime: time.Time{},
+                ProcessStartTime: time.Time{},
             }
         }
         processMap[pid].TCPConns++
@@ -717,6 +775,7 @@ func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
                 Connections: make([]NetworkConnection, 0),
                 LastRemoteDest: "",
                 LastRemoteTime: time.Time{},
+                ProcessStartTime: time.Time{},
             }
         }
         processMap[pid].UDPConns++
@@ -826,7 +885,9 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         allPids[pid] = true
     }
     pidNameCache.RLock()
+    pidStartTimeCache.RLock()
     defer pidNameCache.RUnlock()
+    defer pidStartTimeCache.RUnlock()
     var displayInfos []ProcessDisplayInfo
     now := time.Now()
     
@@ -856,6 +917,26 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         name, ok := pidNameCache.m[pid]
         if !ok {
             name = fmt.Sprintf("PID-%d", pid)
+        }
+        
+        // Get process start time from cache
+        startTime, ok := pidStartTimeCache.m[pid]
+        if !ok {
+            // Try to get it directly
+            startTime, err = getProcessStartTime(pid)
+            if err != nil {
+                startTime = time.Time{}
+            }
+        }
+        details.ProcessStartTime = startTime
+        
+        // Calculate uptime
+        var uptimeStr string
+        if !startTime.IsZero() {
+            uptime := now.Sub(startTime)
+            uptimeStr = formatDuration(uptime)
+        } else {
+            uptimeStr = "N/A"
         }
         
         // Find top remote host
@@ -918,6 +999,7 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
             TopRemoteHost:      topRemoteHost,
             TopRemoteHostConns: topRemoteHostConns,
             LastRemoteDest:     details.LastRemoteDest,
+            Uptime:             uptimeStr,
             UploadRate:         uploadRateStr,
             DownloadRate:       downloadRateStr,
             TotalBytesSent:     totalBytesSentStr,
@@ -1031,7 +1113,9 @@ func showDebugStats() {
         return
     }
     pidNameCache.RLock()
+    pidStartTimeCache.RLock()
     defer pidNameCache.RUnlock()
+    defer pidStartTimeCache.RUnlock()
     fmt.Println("\n=== Enhanced Network Connections ===")
     // Combine all PIDs
     allPids := make(map[uint32]bool)
@@ -1055,12 +1139,14 @@ func showDebugStats() {
         var topRemote string
         var topRemoteCount uint32
         var lastRemoteDest string
+        var startTime time.Time
         
         if tcpData, ok := tcpProcessMap[pid]; ok {
             tcpCount = tcpData.TCPConns
             establishedCount = tcpData.EstablishedConns
             listenPorts = append(listenPorts, tcpData.ListenPorts...)
             lastRemoteDest = tcpData.LastRemoteDest
+            startTime = tcpData.ProcessStartTime
             
             for ip, count := range tcpData.RemoteHosts {
                 if count > topRemoteCount {
@@ -1086,8 +1172,18 @@ func showDebugStats() {
             downloadStr = "N/A"
         }
         
+        // Get uptime
+        var uptimeStr string
+        if !startTime.IsZero() {
+            uptime := time.Since(startTime)
+            uptimeStr = formatDuration(uptime)
+        } else {
+            uptimeStr = "N/A"
+        }
+        
         fmt.Printf("PID %d (%s):\n", pid, name)
         fmt.Printf("  TCP=%d, UDP=%d, Established=%d\n", tcpCount, udpCount, establishedCount)
+        fmt.Printf("  Uptime: %s\n", uptimeStr)
         fmt.Printf("  Upload: %s, Download: %s\n", uploadStr, downloadStr)
         fmt.Printf("  Listen ports: %s\n", formatPorts(listenPorts))
         if topRemote != "" {
@@ -1128,6 +1224,39 @@ func startProcessNameWatcher() {
     }
     update() // Initial update
     ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+    for {
+        <-ticker.C
+        update()
+    }
+}
+
+// --- Process Start Time Watcher ---
+func startProcessStartTimeWatcher() {
+    update := func() {
+        processes, err := ps.Processes()
+        if err != nil {
+            log.Printf("Error getting processes for start times: %v", err)
+            return
+        }
+        
+        startTimeMap := make(map[uint32]time.Time)
+        for _, p := range processes {
+            pid := uint32(p.Pid())
+            startTime, err := getProcessStartTime(pid)
+            if err != nil {
+                continue // Skip processes we can't get start time for
+            }
+            startTimeMap[pid] = startTime
+        }
+        
+        pidStartTimeCache.Lock()
+        pidStartTimeCache.m = startTimeMap
+        pidStartTimeCache.Unlock()
+        log.Printf("Updated process start time cache with %d processes", len(startTimeMap))
+    }
+    update() // Initial update
+    ticker := time.NewTicker(10 * time.Second) // Update less frequently than names
     defer ticker.Stop()
     for {
         <-ticker.C
@@ -1185,6 +1314,7 @@ func main() {
         fmt.Println("Press Ctrl+C to exit")
         // In debug mode, just show network stats periodically
         go startProcessNameWatcher()
+        go startProcessStartTimeWatcher()
         ticker := time.NewTicker(3 * time.Second)
         defer ticker.Stop()
         for {
@@ -1215,6 +1345,7 @@ func main() {
         fmt.Println("- Delayed sorting with configurable delay time")
         fmt.Println("- Shows 'N/A' for data that cannot be accessed due to permissions")
         fmt.Println("- Shows last destination IP for each process")
+        fmt.Println("- Shows process uptime for each process")
         fmt.Println("- Press 'r' to adjust refresh and sort delay settings")
         fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
         fmt.Println("- Press Enter or 'd' to toggle process details")
