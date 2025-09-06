@@ -243,12 +243,21 @@ func startEtwConsumer() {
 			if !isSend && !isRecv {
 				continue
 			}
-			pid, pidOk := e.EventData["PID"].(uint32)
-			size32, sizeOk := e.EventData["size"].(uint32)
-			if !pidOk || !sizeOk {
+			// Get PID from the reliable System.Execution block, which is a uint32.
+			pid := e.System.Execution.ProcessID
+
+			// Get size using the library's helper method, then assert the type.
+			// This is safer than direct map access.
+			sizeVal, ok := e.GetProperty("size")
+			if !ok {
+				continue
+			}
+			size32, ok := sizeVal.(uint32)
+			if !ok {
 				continue
 			}
 			size := uint64(size32)
+
 			statsMap.Lock()
 			stats, ok := statsMap.m[pid]
 			if !ok {
