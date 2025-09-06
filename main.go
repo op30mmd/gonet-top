@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -45,6 +47,9 @@ var statsMap = struct {
 	m map[uint32]*ProcessNetStats
 }{m: make(map[uint32]*ProcessNetStats)}
 
+var previousStats = make(map[uint32]ProcessNetStats)
+var previousStatsLock sync.RWMutex
+
 var pidNameCache = struct {
 	sync.RWMutex
 	m map[uint32]string
@@ -52,21 +57,41 @@ var pidNameCache = struct {
 
 // --- Bubble Tea Model ---
 
+const (
+	colPID = iota
+	colName
+	colSend
+	colRecv
+	colTotal
+)
+
+const displayLimit = 25 // Limit the number of processes shown
+
 type ProcessDisplayInfo struct {
 	PID         uint32
 	ProcessName string
 	SendSpeed   string
 	RecvSpeed   string
+	TotalBytes  uint64
+	SendBps     uint64
+	RecvBps     uint64
 }
 
 type statsUpdatedMsg []ProcessDisplayInfo
 
 type model struct {
-	processes []ProcessDisplayInfo
+	processes  []ProcessDisplayInfo
+	sortColumn int
+	sortAsc    bool
+	noData     bool
 }
 
 func initialModel() model {
-	return model{}
+	return model{
+		sortColumn: colTotal, // Default to sorting by total activity
+		sortAsc:    false,    // Descending
+		noData:     true,
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -75,44 +100,122 @@ func (m model) Init() tea.Cmd {
 	return tick()
 }
 
+func (m *model) setSortColumn(col int) {
+	if m.sortColumn == col {
+		m.sortAsc = !m.sortAsc
+	} else {
+		m.sortColumn = col
+		if col == colPID || col == colName {
+			m.sortAsc = true
+		} else {
+			m.sortAsc = false
+		}
+	}
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+		case "p":
+			m.setSortColumn(colPID)
+		case "n":
+			m.setSortColumn(colName)
+		case "s":
+			m.setSortColumn(colSend)
+		case "r":
+			m.setSortColumn(colRecv)
+		case "t":
+			m.setSortColumn(colTotal)
 		}
 	case statsUpdatedMsg:
 		m.processes = msg
+		m.noData = len(msg) == 0
+
+		// Sort the processes
+		sort.Slice(m.processes, func(i, j int) bool {
+			p1 := m.processes[i]
+			p2 := m.processes[j]
+			var less bool
+			switch m.sortColumn {
+			case colPID:
+				less = p1.PID < p2.PID
+			case colName:
+				less = p1.ProcessName < p2.ProcessName
+			case colSend:
+				less = p1.SendBps < p2.SendBps
+			case colRecv:
+				less = p1.RecvBps < p2.RecvBps
+			case colTotal:
+				less = p1.TotalBytes < p2.TotalBytes
+			}
+			if !m.sortAsc {
+				return !less
+			}
+			return less
+		})
+
+		// Limit the number of processes shown
+		if len(m.processes) > displayLimit {
+			m.processes = m.processes[:displayLimit]
+		}
+
 		return m, tick()
 	}
 	return m, nil
 }
 
 func (m model) View() string {
-	doc := "gonet-top - Network Usage by Process\n\n"
+	var b strings.Builder
+	b.WriteString("gonet-top - Real-time network usage by process\n\n")
+
+	if m.noData {
+		b.WriteString("Waiting for network activity...")
+		return b.String()
+	}
+
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
-	cellStyle := lipgloss.NewStyle().Padding(0, 1)
-	headers := []string{"PID", "Process Name", "Send Speed", "Recv Speed"}
+	renderHeader := func(name string, col int) string {
+		if m.sortColumn == col {
+			if m.sortAsc {
+				name += " ▴"
+			} else {
+				name += " ▾"
+			}
+		}
+		return headerStyle.Render(name)
+	}
+
+	headers := []string{"PID", "Process Name", "Send Speed", "Recv Speed", "Total"}
 	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
-		headerStyle.Copy().Width(10).Render(headers[0]),
-		headerStyle.Copy().Width(30).Render(headers[1]),
-		headerStyle.Copy().Width(15).Render(headers[2]),
-		headerStyle.Copy().Width(15).Render(headers[3]),
+		lipgloss.NewStyle().Width(10).Render(renderHeader(headers[0], colPID)),
+		lipgloss.NewStyle().Width(25).Render(renderHeader(headers[1], colName)),
+		lipgloss.NewStyle().Width(15).Render(renderHeader(headers[2], colSend)),
+		lipgloss.NewStyle().Width(15).Render(renderHeader(headers[3], colRecv)),
+		lipgloss.NewStyle().Width(15).Render(renderHeader(headers[4], colTotal)),
 	)
-	doc += headerRow + "\n"
+	b.WriteString(headerRow + "\n")
+
+	cellStyle := lipgloss.NewStyle().Padding(0, 1)
 	for _, p := range m.processes {
 		pidStr := fmt.Sprintf("%d", p.PID)
+		totalStr := formatBytes(p.TotalBytes)
 		row := lipgloss.JoinHorizontal(lipgloss.Left,
 			cellStyle.Copy().Width(10).Render(pidStr),
-			cellStyle.Copy().Width(30).Render(p.ProcessName),
+			cellStyle.Copy().Width(25).Render(p.ProcessName),
 			cellStyle.Copy().Width(15).Render(p.SendSpeed),
 			cellStyle.Copy().Width(15).Render(p.RecvSpeed),
+			cellStyle.Copy().Width(15).Render(totalStr),
 		)
-		doc += row + "\n"
+		b.WriteString(row + "\n")
 	}
-	doc += "\n\nPress 'q' or 'ctrl+c' to quit."
-	return doc
+
+	helpText := "\n  Sort by: (p)id (n)ame (s)end (r)ecv (t)otal | (q)uit"
+	b.WriteString(helpText)
+
+	return b.String()
 }
 
 // --- Ticker and Data Calculation ---
@@ -124,39 +227,58 @@ func tick() tea.Cmd {
 }
 
 func calculateRates() statsUpdatedMsg {
-	statsMap.Lock()
-	currentStats := statsMap.m
-	statsMap.m = make(map[uint32]*ProcessNetStats)
-	statsMap.Unlock()
+	var displayInfos []ProcessDisplayInfo
+	statsMap.RLock()
+	currentStats := make(map[uint32]ProcessNetStats, len(statsMap.m))
+	for pid, stats := range statsMap.m {
+		currentStats[pid] = *stats
+	}
+	statsMap.RUnlock()
 	pidNameCache.RLock()
 	defer pidNameCache.RUnlock()
-	var displayInfos []ProcessDisplayInfo
-	for pid, stats := range currentStats {
-		name, ok := pidNameCache.m[pid]
+	previousStatsLock.Lock()
+	defer previousStatsLock.Unlock()
+
+	for pid, current := range currentStats {
+		prev, ok := previousStats[pid]
 		if !ok {
+			prev = ProcessNetStats{PID: pid}
+		}
+		sendBps := current.SentBytes - prev.SentBytes
+		recvBps := current.RecvBytes - prev.RecvBytes
+		name, nameOk := pidNameCache.m[pid]
+		if !nameOk {
 			name = "N/A"
 		}
 		displayInfos = append(displayInfos, ProcessDisplayInfo{
-			PID:         stats.PID,
+			PID:         pid,
 			ProcessName: name,
-			SendSpeed:   formatSpeed(stats.SentBytes),
-			RecvSpeed:   formatSpeed(stats.RecvBytes),
+			SendSpeed:   formatSpeed(sendBps),
+			RecvSpeed:   formatSpeed(recvBps),
+			SendBps:     sendBps,
+			RecvBps:     recvBps,
+			TotalBytes:  current.SentBytes + current.RecvBytes,
 		})
 	}
+	previousStats = currentStats
 	return statsUpdatedMsg(displayInfos)
 }
 
 func formatSpeed(bytes uint64) string {
+	return formatBytes(bytes) + "/s"
+}
+
+func formatBytes(bytes uint64) string {
 	const unit = 1024
 	if bytes < unit {
-		return fmt.Sprintf("%d B/s", bytes)
+		return fmt.Sprintf("%d B", bytes)
 	}
 	div, exp := int64(unit), 0
 	for n := bytes / unit; n >= unit; n /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.2f %cB/s", float64(bytes)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.2f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 // --- Process Name Discovery ---
@@ -184,7 +306,7 @@ func startProcessNameWatcher() {
 		pidNameCache.m = names
 		pidNameCache.Unlock()
 	}
-	update() // Initial update
+	update()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -196,30 +318,24 @@ func startProcessNameWatcher() {
 // --- Main and ETW Logic ---
 
 func main() {
-	// Setup logging to a file for debugging in CI.
 	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
 		os.Exit(1)
 	}
 	log.SetOutput(logFile)
-
 	if !isAdmin() {
 		log.Println("Error: Administrator privileges are required.")
-		// Also print to stdout for the user.
 		fmt.Println("Error: Administrator privileges are required.")
 		fmt.Println("Please restart the application from a terminal with 'Run as administrator'.")
 		return
 	}
-
-	// Setup TUI output to a different file for CI testing.
 	tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open TUI log file: %v", err)
 	}
 	defer tuiLogFile.Close()
-
-	p := tea.NewProgram(initialModel(), tea.WithOutput(tuiLogFile), tea.WithAltScreen())
+	p := tea.NewProgram(&model{}, tea.WithOutput(tuiLogFile), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatalf("Alas, there's been an error: %v", err)
 	}
@@ -237,27 +353,38 @@ func startEtwConsumer() {
 	c.FromSessions(s)
 	go func() {
 		for e := range c.Events {
+			log.Printf("Received event with Opcode: %d", e.System.Opcode.Value)
 			opcode := e.System.Opcode.Value
 			isSend := opcode == opcodeTCPSend || opcode == opcodeUDPSend
 			isRecv := opcode == opcodeTCPReceive || opcode == opcodeUDPReceive
 			if !isSend && !isRecv {
 				continue
 			}
-			// Get PID from the reliable System.Execution block, which is a uint32.
 			pid := e.System.Execution.ProcessID
-
-			// Get size using the library's helper method, then assert the type.
-			// This is safer than direct map access.
+			if pid == 0 {
+				continue
+			}
+			var size uint64
 			sizeVal, ok := e.GetProperty("size")
 			if !ok {
-				continue
+				sizeVal, ok = e.GetProperty("datalen")
 			}
-			size32, ok := sizeVal.(uint32)
 			if !ok {
+				log.Printf("Skipping event, no size field found.")
 				continue
 			}
-			size := uint64(size32)
-
+			switch s := sizeVal.(type) {
+			case uint16:
+				size = uint64(s)
+			case uint32:
+				size = uint64(s)
+			case uint64:
+				size = s
+			default:
+				log.Printf("Skipping event, unsupported type for size: %T", s)
+				continue
+			}
+			log.Printf("Successfully parsed event for PID %d with size %d", pid, size)
 			statsMap.Lock()
 			stats, ok := statsMap.m[pid]
 			if !ok {
