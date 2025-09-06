@@ -9,7 +9,6 @@ import (
 	"log"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -40,15 +39,15 @@ type ProcessNetStats struct {
 	PID       uint32
 	SentBytes uint64
 	RecvBytes uint64
+	LastSent  uint64
+	LastRecv  uint64
+	UpdatedAt time.Time
 }
 
 var statsMap = struct {
 	sync.RWMutex
 	m map[uint32]*ProcessNetStats
 }{m: make(map[uint32]*ProcessNetStats)}
-
-var previousStats = make(map[uint32]ProcessNetStats)
-var previousStatsLock sync.RWMutex
 
 var pidNameCache = struct {
 	sync.RWMutex
@@ -57,40 +56,25 @@ var pidNameCache = struct {
 
 // --- Bubble Tea Model ---
 
-const (
-	colPID = iota
-	colName
-	colSend
-	colRecv
-	colTotal
-)
-
-const displayLimit = 25 // Limit the number of processes shown
-
 type ProcessDisplayInfo struct {
 	PID         uint32
 	ProcessName string
 	SendSpeed   string
 	RecvSpeed   string
-	TotalBytes  uint64
-	SendBps     uint64
-	RecvBps     uint64
+	TotalSent   uint64
+	TotalRecv   uint64
 }
 
 type statsUpdatedMsg []ProcessDisplayInfo
 
 type model struct {
-	processes  []ProcessDisplayInfo
-	sortColumn int
-	sortAsc    bool
-	noData     bool
+	processes []ProcessDisplayInfo
+	lastUpdate time.Time
 }
 
 func initialModel() model {
 	return model{
-		sortColumn: colTotal, // Default to sorting by total activity
-		sortAsc:    false,    // Descending
-		noData:     true,
+		lastUpdate: time.Now(),
 	}
 }
 
@@ -100,172 +84,165 @@ func (m model) Init() tea.Cmd {
 	return tick()
 }
 
-func (m *model) setSortColumn(col int) {
-	if m.sortColumn == col {
-		m.sortAsc = !m.sortAsc
-	} else {
-		m.sortColumn = col
-		if col == colPID || col == colName {
-			m.sortAsc = true
-		} else {
-			m.sortAsc = false
-		}
-	}
-}
-
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
-		case "p":
-			m.setSortColumn(colPID)
-		case "n":
-			m.setSortColumn(colName)
-		case "s":
-			m.setSortColumn(colSend)
-		case "r":
-			m.setSortColumn(colRecv)
-		case "t":
-			m.setSortColumn(colTotal)
 		}
 	case statsUpdatedMsg:
 		m.processes = msg
-		m.noData = len(msg) == 0
-
-		// Sort the processes
-		sort.Slice(m.processes, func(i, j int) bool {
-			p1 := m.processes[i]
-			p2 := m.processes[j]
-			var less bool
-			switch m.sortColumn {
-			case colPID:
-				less = p1.PID < p2.PID
-			case colName:
-				less = p1.ProcessName < p2.ProcessName
-			case colSend:
-				less = p1.SendBps < p2.SendBps
-			case colRecv:
-				less = p1.RecvBps < p2.RecvBps
-			case colTotal:
-				less = p1.TotalBytes < p2.TotalBytes
-			}
-			if !m.sortAsc {
-				return !less
-			}
-			return less
-		})
-
-		// Limit the number of processes shown
-		if len(m.processes) > displayLimit {
-			m.processes = m.processes[:displayLimit]
-		}
-
+		m.lastUpdate = time.Now()
 		return m, tick()
 	}
 	return m, nil
 }
 
 func (m model) View() string {
-	var b strings.Builder
-	b.WriteString("gonet-top - Real-time network usage by process\n\n")
-
-	if m.noData {
-		b.WriteString("Waiting for network activity...")
-		return b.String()
-	}
+	doc := "gonet-top - Network Usage by Process\n"
+	doc += fmt.Sprintf("Last updated: %s\n", m.lastUpdate.Format("15:04:05"))
+	doc += fmt.Sprintf("Active processes: %d\n\n", len(m.processes))
 
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
-	renderHeader := func(name string, col int) string {
-		if m.sortColumn == col {
-			if m.sortAsc {
-				name += " ▴"
-			} else {
-				name += " ▾"
-			}
-		}
-		return headerStyle.Render(name)
-	}
-
-	headers := []string{"PID", "Process Name", "Send Speed", "Recv Speed", "Total"}
-	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
-		lipgloss.NewStyle().Width(10).Render(renderHeader(headers[0], colPID)),
-		lipgloss.NewStyle().Width(25).Render(renderHeader(headers[1], colName)),
-		lipgloss.NewStyle().Width(15).Render(renderHeader(headers[2], colSend)),
-		lipgloss.NewStyle().Width(15).Render(renderHeader(headers[3], colRecv)),
-		lipgloss.NewStyle().Width(15).Render(renderHeader(headers[4], colTotal)),
-	)
-	b.WriteString(headerRow + "\n")
-
 	cellStyle := lipgloss.NewStyle().Padding(0, 1)
-	for _, p := range m.processes {
-		pidStr := fmt.Sprintf("%d", p.PID)
-		totalStr := formatBytes(p.TotalBytes)
-		row := lipgloss.JoinHorizontal(lipgloss.Left,
-			cellStyle.Copy().Width(10).Render(pidStr),
-			cellStyle.Copy().Width(25).Render(p.ProcessName),
-			cellStyle.Copy().Width(15).Render(p.SendSpeed),
-			cellStyle.Copy().Width(15).Render(p.RecvSpeed),
-			cellStyle.Copy().Width(15).Render(totalStr),
-		)
-		b.WriteString(row + "\n")
+
+	headers := []string{"PID", "Process Name", "Send Rate", "Recv Rate", "Total Sent", "Total Recv"}
+	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
+		headerStyle.Copy().Width(8).Render(headers[0]),
+		headerStyle.Copy().Width(20).Render(headers[1]),
+		headerStyle.Copy().Width(12).Render(headers[2]),
+		headerStyle.Copy().Width(12).Render(headers[3]),
+		headerStyle.Copy().Width(12).Render(headers[4]),
+		headerStyle.Copy().Width(12).Render(headers[5]),
+	)
+	doc += headerRow + "\n"
+
+	if len(m.processes) == 0 {
+		doc += "No network activity detected yet...\n"
+		doc += "Try browsing the web or downloading a file to see data.\n"
+	} else {
+		for _, p := range m.processes {
+			pidStr := fmt.Sprintf("%d", p.PID)
+			row := lipgloss.JoinHorizontal(lipgloss.Left,
+				cellStyle.Copy().Width(8).Render(pidStr),
+				cellStyle.Copy().Width(20).Render(truncateString(p.ProcessName, 18)),
+				cellStyle.Copy().Width(12).Render(p.SendSpeed),
+				cellStyle.Copy().Width(12).Render(p.RecvSpeed),
+				cellStyle.Copy().Width(12).Render(formatBytes(p.TotalSent)),
+				cellStyle.Copy().Width(12).Render(formatBytes(p.TotalRecv)),
+			)
+			doc += row + "\n"
+		}
 	}
 
-	helpText := "\n  Sort by: (p)id (n)ame (s)end (r)ecv (t)otal | (q)uit"
-	b.WriteString(helpText)
+	doc += "\n\nPress 'q' or 'ctrl+c' to quit."
+	return doc
+}
 
-	return b.String()
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
 
 // --- Ticker and Data Calculation ---
 
 func tick() tea.Cmd {
-	return tea.Tick(time.Second*1, func(t time.Time) tea.Msg {
+	return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
 		return calculateRates()
 	})
 }
 
 func calculateRates() statsUpdatedMsg {
-	var displayInfos []ProcessDisplayInfo
-	statsMap.RLock()
-	currentStats := make(map[uint32]ProcessNetStats, len(statsMap.m))
+	now := time.Now()
+
+	statsMap.Lock()
+	currentStats := make(map[uint32]*ProcessNetStats)
 	for pid, stats := range statsMap.m {
-		currentStats[pid] = *stats
+		// Copy the stats to avoid data races
+		currentStats[pid] = &ProcessNetStats{
+			PID:       stats.PID,
+			SentBytes: stats.SentBytes,
+			RecvBytes: stats.RecvBytes,
+			LastSent:  stats.LastSent,
+			LastRecv:  stats.LastRecv,
+			UpdatedAt: stats.UpdatedAt,
+		}
 	}
-	statsMap.RUnlock()
+	statsMap.Unlock()
+
 	pidNameCache.RLock()
 	defer pidNameCache.RUnlock()
-	previousStatsLock.Lock()
-	defer previousStatsLock.Unlock()
 
-	for pid, current := range currentStats {
-		prev, ok := previousStats[pid]
+	var displayInfos []ProcessDisplayInfo
+
+	for pid, stats := range currentStats {
+		// Skip processes with no activity
+		if stats.SentBytes == 0 && stats.RecvBytes == 0 {
+			continue
+		}
+
+		// Calculate rates based on time difference
+		timeDiff := now.Sub(stats.UpdatedAt).Seconds()
+		if timeDiff <= 0 {
+			timeDiff = 1
+		}
+
+		sendRate := float64(stats.SentBytes-stats.LastSent) / timeDiff
+		recvRate := float64(stats.RecvBytes-stats.LastRecv) / timeDiff
+
+		// Update last values for next calculation
+		statsMap.Lock()
+		if s, exists := statsMap.m[pid]; exists {
+			s.LastSent = stats.SentBytes
+			s.LastRecv = stats.RecvBytes
+			s.UpdatedAt = now
+		}
+		statsMap.Unlock()
+
+		name, ok := pidNameCache.m[pid]
 		if !ok {
-			prev = ProcessNetStats{PID: pid}
+			name = fmt.Sprintf("PID-%d", pid)
 		}
-		sendBps := current.SentBytes - prev.SentBytes
-		recvBps := current.RecvBytes - prev.RecvBytes
-		name, nameOk := pidNameCache.m[pid]
-		if !nameOk {
-			name = "N/A"
-		}
+
 		displayInfos = append(displayInfos, ProcessDisplayInfo{
 			PID:         pid,
 			ProcessName: name,
-			SendSpeed:   formatSpeed(sendBps),
-			RecvSpeed:   formatSpeed(recvBps),
-			SendBps:     sendBps,
-			RecvBps:     recvBps,
-			TotalBytes:  current.SentBytes + current.RecvBytes,
+			SendSpeed:   formatSpeed(uint64(sendRate)),
+			RecvSpeed:   formatSpeed(uint64(recvRate)),
+			TotalSent:   stats.SentBytes,
+			TotalRecv:   stats.RecvBytes,
 		})
 	}
-	previousStats = currentStats
+
+	// Sort by total bytes (sent + received) descending
+	sort.Slice(displayInfos, func(i, j int) bool {
+		totalI := displayInfos[i].TotalSent + displayInfos[i].TotalRecv
+		totalJ := displayInfos[j].TotalSent + displayInfos[j].TotalRecv
+		return totalI > totalJ
+	})
+
+	// Limit to top 20 processes to avoid clutter
+	if len(displayInfos) > 20 {
+		displayInfos = displayInfos[:20]
+	}
+
 	return statsUpdatedMsg(displayInfos)
 }
 
 func formatSpeed(bytes uint64) string {
-	return formatBytes(bytes) + "/s"
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B/s", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB/s", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 func formatBytes(bytes uint64) string {
@@ -278,7 +255,7 @@ func formatBytes(bytes uint64) string {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.2f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 // --- Process Name Discovery ---
@@ -305,10 +282,13 @@ func startProcessNameWatcher() {
 		pidNameCache.Lock()
 		pidNameCache.m = names
 		pidNameCache.Unlock()
+		log.Printf("Updated process names cache with %d processes", len(names))
 	}
-	update()
+
+	update() // Initial update
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
 	for {
 		<-ticker.C
 		update()
@@ -318,88 +298,142 @@ func startProcessNameWatcher() {
 // --- Main and ETW Logic ---
 
 func main() {
-	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+	// Setup logging to a file for debugging in CI.
+	logFile, err := os.OpenFile("app.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open log file: %v\n", err)
 		os.Exit(1)
 	}
+	defer logFile.Close()
 	log.SetOutput(logFile)
+
+	log.Println("Starting gonet-top...")
+
 	if !isAdmin() {
 		log.Println("Error: Administrator privileges are required.")
 		fmt.Println("Error: Administrator privileges are required.")
 		fmt.Println("Please restart the application from a terminal with 'Run as administrator'.")
 		return
 	}
-	tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY, 0666)
+
+	log.Println("Admin check passed")
+
+	// Setup TUI output to a different file for CI testing.
+	tuiLogFile, err := os.OpenFile("tui.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open TUI log file: %v", err)
 	}
 	defer tuiLogFile.Close()
-	p := tea.NewProgram(&model{}, tea.WithOutput(tuiLogFile), tea.WithAltScreen())
+
+	log.Println("Starting Bubble Tea program...")
+	p := tea.NewProgram(initialModel(), tea.WithOutput(tuiLogFile), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatalf("Alas, there's been an error: %v", err)
 	}
 }
 
 func startEtwConsumer() {
+	log.Println("Starting ETW consumer...")
+
 	s := etw.NewRealTimeSession("gonet-top-session")
 	defer s.Stop()
+
 	if err := s.EnableProvider(etw.MustParseProvider(networkProviderGUID)); err != nil {
 		log.Printf("Failed to enable provider: %s", err)
 		return
 	}
+
+	log.Println("ETW provider enabled successfully")
+
 	c := etw.NewRealTimeConsumer(context.Background())
 	defer c.Stop()
+
 	c.FromSessions(s)
+
+	// Start event processing goroutine
 	go func() {
+		eventCount := 0
+		log.Println("Starting to process ETW events...")
+
 		for e := range c.Events {
-			log.Printf("Received event with Opcode: %d", e.System.Opcode.Value)
+			eventCount++
+			if eventCount%100 == 0 {
+				log.Printf("Processed %d events", eventCount)
+			}
+
 			opcode := e.System.Opcode.Value
 			isSend := opcode == opcodeTCPSend || opcode == opcodeUDPSend
 			isRecv := opcode == opcodeTCPReceive || opcode == opcodeUDPReceive
+
 			if !isSend && !isRecv {
 				continue
 			}
-			pid := e.System.Execution.ProcessID
-			if pid == 0 {
+
+			// Try different field names for PID
+			var pid uint32
+			var pidOk bool
+
+			if p, ok := e.EventData["PID"].(uint32); ok {
+				pid, pidOk = p, true
+			} else if p, ok := e.EventData["ProcessId"].(uint32); ok {
+				pid, pidOk = p, true
+			} else if p, ok := e.EventData["pid"].(uint32); ok {
+				pid, pidOk = p, true
+			}
+
+			// Try different field names for size
+			var size32 uint32
+			var sizeOk bool
+
+			if s, ok := e.EventData["size"].(uint32); ok {
+				size32, sizeOk = s, true
+			} else if s, ok := e.EventData["Size"].(uint32); ok {
+				size32, sizeOk = s, true
+			} else if s, ok := e.EventData["DataLength"].(uint32); ok {
+				size32, sizeOk = s, true
+			} else if s, ok := e.EventData["Length"].(uint32); ok {
+				size32, sizeOk = s, true
+			}
+
+			if !pidOk || !sizeOk {
+				if eventCount <= 10 {
+					log.Printf("Event data fields: %+v", e.EventData)
+				}
 				continue
 			}
-			var size uint64
-			sizeVal, ok := e.GetProperty("size")
-			if !ok {
-				sizeVal, ok = e.GetProperty("datalen")
+
+			if eventCount <= 5 {
+				log.Printf("Processing event: PID=%d, Size=%d, Opcode=%d, IsSend=%t", pid, size32, opcode, isSend)
 			}
-			if !ok {
-				log.Printf("Skipping event, no size field found.")
-				continue
-			}
-			switch s := sizeVal.(type) {
-			case uint16:
-				size = uint64(s)
-			case uint32:
-				size = uint64(s)
-			case uint64:
-				size = s
-			default:
-				log.Printf("Skipping event, unsupported type for size: %T", s)
-				continue
-			}
-			log.Printf("Successfully parsed event for PID %d with size %d", pid, size)
+
+			size := uint64(size32)
+
 			statsMap.Lock()
 			stats, ok := statsMap.m[pid]
 			if !ok {
-				stats = &ProcessNetStats{PID: pid}
+				stats = &ProcessNetStats{
+					PID:       pid,
+					UpdatedAt: time.Now(),
+				}
 				statsMap.m[pid] = stats
 			}
+
 			if isSend {
 				stats.SentBytes += size
 			} else if isRecv {
 				stats.RecvBytes += size
 			}
+			stats.UpdatedAt = time.Now()
 			statsMap.Unlock()
 		}
+
+		log.Println("ETW event processing stopped")
 	}()
+
+	// Start the consumer
 	if err := c.Start(); err != nil {
 		log.Printf("Error starting consumer: %s", err)
+	} else {
+		log.Println("ETW consumer started successfully")
 	}
 }
