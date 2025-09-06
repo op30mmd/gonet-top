@@ -336,7 +336,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             close(m.nameWatcherDone)
             close(m.startTimeWatcherDone)
             return m, tea.Quit
-        case "up", "k":
+        case "up", "u":
             if m.showSettings {
                 // In settings mode, adjust refresh delay
                 appSettings.Lock()
