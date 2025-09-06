@@ -96,6 +96,7 @@ type NetworkConnection struct {
     RemotePort  uint16
     State       string
     PID         uint32
+    Timestamp   time.Time // Added timestamp for tracking last connection
 }
 
 type ProcessNetDetails struct {
@@ -108,6 +109,8 @@ type ProcessNetDetails struct {
     RemoteHosts        map[string]uint32 // IP -> count
     TopRemoteHost      string
     TopRemoteHostConns uint32
+    LastRemoteDest     string // Added for last destination tracking
+    LastRemoteTime     time.Time // Added for timestamp tracking
     BytesSent          uint64
     BytesReceived      uint64
     LastUpdate         time.Time
@@ -148,6 +151,7 @@ type ProcessDisplayInfo struct {
     EstablishedConns   uint32
     TopRemoteHost      string
     TopRemoteHostConns uint32
+    LastRemoteDest     string // Added for last destination display
     UploadRate         string // Formatted string
     DownloadRate       string // Formatted string
     TotalBytesSent     string // Formatted string
@@ -390,15 +394,16 @@ func (m model) renderSummaryView() string {
     headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
     cellStyle := lipgloss.NewStyle().Padding(0, 1)
     selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
-    headers := []string{"PID", "Process Name", "TCP", "UDP", "Total", "Upload", "Download"}
+    headers := []string{"PID", "Process Name", "TCP", "UDP", "Total", "Upload", "Download", "Last Destination"}
     headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
         headerStyle.Copy().Width(8).Render(headers[0]),
-        headerStyle.Copy().Width(16).Render(headers[1]),
+        headerStyle.Copy().Width(14).Render(headers[1]),
         headerStyle.Copy().Width(6).Render(headers[2]),
         headerStyle.Copy().Width(6).Render(headers[3]),
         headerStyle.Copy().Width(6).Render(headers[4]),
         headerStyle.Copy().Width(10).Render(headers[5]),
         headerStyle.Copy().Width(10).Render(headers[6]),
+        headerStyle.Copy().Width(20).Render(headers[7]),
     )
     doc.WriteString(headerRow + "\n")
     for i, p := range m.processes {
@@ -406,14 +411,20 @@ func (m model) renderSummaryView() string {
         if i == m.selectedIdx {
             style = selectedStyle
         }
+        // Format last destination
+        lastDest := p.LastRemoteDest
+        if lastDest == "" {
+            lastDest = "-"
+        }
         row := lipgloss.JoinHorizontal(lipgloss.Left,
             style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
-            style.Copy().Width(16).Render(truncateString(p.ProcessName, 14)),
+            style.Copy().Width(14).Render(truncateString(p.ProcessName, 12)),
             style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TCPConns)),
             style.Copy().Width(6).Render(fmt.Sprintf("%d", p.UDPConns)),
             style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TotalConns)),
             style.Copy().Width(10).Render(p.UploadRate),
             style.Copy().Width(10).Render(p.DownloadRate),
+            style.Copy().Width(20).Render(truncateString(lastDest, 18)),
         )
         doc.WriteString(row + "\n")
     }
@@ -426,15 +437,16 @@ func (m model) renderDetailedView() string {
     headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
     cellStyle := lipgloss.NewStyle().Padding(0, 1)
     selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
-    headers := []string{"PID", "Process", "TCP", "UDP", "EST", "Up/s", "Down/s"}
+    headers := []string{"PID", "Process", "TCP", "UDP", "EST", "Up/s", "Down/s", "Last Dest"}
     headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
         headerStyle.Copy().Width(8).Render(headers[0]),
-        headerStyle.Copy().Width(12).Render(headers[1]),
+        headerStyle.Copy().Width(10).Render(headers[1]),
         headerStyle.Copy().Width(5).Render(headers[2]),
         headerStyle.Copy().Width(5).Render(headers[3]),
         headerStyle.Copy().Width(5).Render(headers[4]),
         headerStyle.Copy().Width(10).Render(headers[5]),
         headerStyle.Copy().Width(10).Render(headers[6]),
+        headerStyle.Copy().Width(16).Render(headers[7]),
     )
     doc.WriteString(headerRow + "\n")
     for i, p := range m.processes {
@@ -442,14 +454,20 @@ func (m model) renderDetailedView() string {
         if i == m.selectedIdx {
             style = selectedStyle
         }
+        // Format last destination
+        lastDest := p.LastRemoteDest
+        if lastDest == "" {
+            lastDest = "-"
+        }
         row := lipgloss.JoinHorizontal(lipgloss.Left,
             style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
-            style.Copy().Width(12).Render(truncateString(p.ProcessName, 10)),
+            style.Copy().Width(10).Render(truncateString(p.ProcessName, 8)),
             style.Copy().Width(5).Render(fmt.Sprintf("%d", p.TCPConns)),
             style.Copy().Width(5).Render(fmt.Sprintf("%d", p.UDPConns)),
             style.Copy().Width(5).Render(fmt.Sprintf("%d", p.EstablishedConns)),
             style.Copy().Width(10).Render(p.UploadRate),
             style.Copy().Width(10).Render(p.DownloadRate),
+            style.Copy().Width(16).Render(truncateString(lastDest, 14)),
         )
         doc.WriteString(row + "\n")
     }
@@ -470,6 +488,9 @@ func (m model) renderDetailedView() string {
         if selected.TopRemoteHost != "" {
             details.WriteString(fmt.Sprintf("Top Remote Host: %s (%d connections)\n", selected.TopRemoteHost, selected.TopRemoteHostConns))
         }
+        if selected.LastRemoteDest != "" {
+            details.WriteString(fmt.Sprintf("Last Destination: %s\n", selected.LastRemoteDest))
+        }
         
         doc.WriteString(detailStyle.Render(details.String()))
     }
@@ -489,7 +510,7 @@ func (m model) renderConnectionsView() string {
     doc.WriteString(titleStyle.Render(fmt.Sprintf("Active Connections for %s (PID %d)", selected.ProcessName, selected.PID)))
     doc.WriteString("\n\n")
     doc.WriteString(fmt.Sprintf("Upload: %s/s | Download: %s/s\n", selected.UploadRate, selected.DownloadRate))
-    doc.WriteString(fmt.Sprintf("Total Sent: %s | Total Received: %s\n\n", 
+    doc.WriteString(fmt.Sprintf("Total Sent: %s | Total Received: %s\n", 
         selected.TotalBytesSent, selected.TotalBytesReceived))
     
     if len(selected.Connections) == 0 {
@@ -616,6 +637,8 @@ func getTcpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
                 PID:         pid,
                 RemoteHosts: make(map[string]uint32),
                 Connections: make([]NetworkConnection, 0),
+                LastRemoteDest: "",
+                LastRemoteTime: time.Time{},
             }
         }
         processMap[pid].TCPConns++
@@ -639,6 +662,11 @@ func getTcpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
         if row.State == 2 { // LISTEN
             processMap[pid].ListenPorts = append(processMap[pid].ListenPorts, localPort)
         }
+        // Update last remote destination for established connections
+        if row.State == 5 && remoteIP != "0.0.0.0" && remoteIP != "127.0.0.1" {
+            processMap[pid].LastRemoteDest = remoteIP
+            processMap[pid].LastRemoteTime = time.Now()
+        }
         // Create connection record
         conn := NetworkConnection{
             Protocol:   "TCP",
@@ -648,6 +676,7 @@ func getTcpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
             RemotePort: remotePort,
             State:      state,
             PID:        pid,
+            Timestamp:  time.Now(),
         }
         processMap[pid].Connections = append(processMap[pid].Connections, conn)
         allConnections = append(allConnections, conn)
@@ -686,6 +715,8 @@ func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
                 PID:         pid,
                 RemoteHosts: make(map[string]uint32),
                 Connections: make([]NetworkConnection, 0),
+                LastRemoteDest: "",
+                LastRemoteTime: time.Time{},
             }
         }
         processMap[pid].UDPConns++
@@ -703,6 +734,7 @@ func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
             RemotePort: 0,
             State:      "LISTEN",
             PID:        pid,
+            Timestamp:  time.Now(),
         }
         processMap[pid].Connections = append(processMap[pid].Connections, conn)
         allConnections = append(allConnections, conn)
@@ -885,6 +917,7 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
             EstablishedConns:   details.EstablishedConns,
             TopRemoteHost:      topRemoteHost,
             TopRemoteHostConns: topRemoteHostConns,
+            LastRemoteDest:     details.LastRemoteDest,
             UploadRate:         uploadRateStr,
             DownloadRate:       downloadRateStr,
             TotalBytesSent:     totalBytesSentStr,
@@ -1021,11 +1054,13 @@ func showDebugStats() {
         var listenPorts []uint16
         var topRemote string
         var topRemoteCount uint32
+        var lastRemoteDest string
         
         if tcpData, ok := tcpProcessMap[pid]; ok {
             tcpCount = tcpData.TCPConns
             establishedCount = tcpData.EstablishedConns
             listenPorts = append(listenPorts, tcpData.ListenPorts...)
+            lastRemoteDest = tcpData.LastRemoteDest
             
             for ip, count := range tcpData.RemoteHosts {
                 if count > topRemoteCount {
@@ -1057,6 +1092,9 @@ func showDebugStats() {
         fmt.Printf("  Listen ports: %s\n", formatPorts(listenPorts))
         if topRemote != "" {
             fmt.Printf("  Top remote: %s (%d conns)\n", topRemote, topRemoteCount)
+        }
+        if lastRemoteDest != "" {
+            fmt.Printf("  Last destination: %s\n", lastRemoteDest)
         }
         fmt.Println()
     }
@@ -1176,6 +1214,7 @@ func main() {
         fmt.Println("- Sort options: connections, upload rate, download rate, process name, PID, total IO")
         fmt.Println("- Delayed sorting with configurable delay time")
         fmt.Println("- Shows 'N/A' for data that cannot be accessed due to permissions")
+        fmt.Println("- Shows last destination IP for each process")
         fmt.Println("- Press 'r' to adjust refresh and sort delay settings")
         fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
         fmt.Println("- Press Enter or 'd' to toggle process details")
