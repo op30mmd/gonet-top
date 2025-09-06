@@ -137,8 +137,13 @@ type ProcessDisplayInfo struct {
     TotalBytesSent     uint64
     TotalBytesReceived uint64
     Connections        []NetworkConnection
+    UploadRateValue    float64 // For sorting
+    DownloadRateValue  float64 // For sorting
 }
-type statsUpdatedMsg []ProcessDisplayInfo
+type statsUpdatedMsg struct {
+    processes []ProcessDisplayInfo
+    sortBy    int
+}
 type model struct {
     processes   []ProcessDisplayInfo
     lastUpdate  time.Time
@@ -186,7 +191,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         }
     case statsUpdatedMsg:
         oldSelected := m.selectedIdx
-        m.processes = msg
+        m.processes = msg.processes
         m.lastUpdate = time.Now()
         // Keep selection in bounds
         if oldSelected >= len(m.processes) && len(m.processes) > 0 {
@@ -419,7 +424,10 @@ func formatBytesPerSecond(bytesPerSec float64) string {
 // --- Ticker ---
 func tick() tea.Cmd {
     return tea.Tick(time.Second*2, func(t time.Time) tea.Msg {
-        return getEnhancedNetworkStats()
+        // We need to get the current sort mode from the model
+        // Since we can't access it directly, we'll pass 0 for now
+        // and handle sorting in the Update method
+        return getEnhancedNetworkStats(0)
     })
 }
 // --- Get Process I/O Counters ---
@@ -575,7 +583,7 @@ func ipFromUint32(addr uint32) string {
 func portFromUint32(port uint32) uint16 {
     return uint16((port&0xFF)<<8 | (port>>8)&0xFF)
 }
-func getEnhancedNetworkStats() statsUpdatedMsg {
+func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
     tcpProcessMap, _, err := getTcpConnections()
     if err != nil {
         log.Printf("Error getting TCP connections: %v", err)
@@ -671,6 +679,8 @@ func getEnhancedNetworkStats() statsUpdatedMsg {
             TotalBytesSent:     ioCounters.WriteTransferCount,
             TotalBytesReceived: ioCounters.ReadTransferCount,
             Connections:        connections,
+            UploadRateValue:    uploadRate,
+            DownloadRateValue:  downloadRate,
         })
         
         // Update the stats map with current values for next calculation
@@ -688,17 +698,14 @@ func getEnhancedNetworkStats() statsUpdatedMsg {
     statsMap.RUnlock()
     
     // Sort based on current sort mode
-    switch statsMap.m.sortBy {
+    switch sortBy {
     case 1: // Sort by upload rate
         sort.Slice(displayInfos, func(i, j int) bool {
-            // Convert formatted strings back to numbers for comparison
-            // This is a simplified approach - in a real implementation, 
-            // you'd want to store the numeric values
-            return displayInfos[i].UploadRate > displayInfos[j].UploadRate
+            return displayInfos[i].UploadRateValue > displayInfos[j].UploadRateValue
         })
     case 2: // Sort by download rate
         sort.Slice(displayInfos, func(i, j int) bool {
-            return displayInfos[i].DownloadRate > displayInfos[j].DownloadRate
+            return displayInfos[i].DownloadRateValue > displayInfos[j].DownloadRateValue
         })
     default: // Sort by total connections
         sort.Slice(displayInfos, func(i, j int) bool {
@@ -711,7 +718,10 @@ func getEnhancedNetworkStats() statsUpdatedMsg {
         displayInfos = displayInfos[:50]
     }
     
-    return statsUpdatedMsg(displayInfos)
+    return statsUpdatedMsg{
+        processes: displayInfos,
+        sortBy:    sortBy,
+    }
 }
 func formatPorts(ports []uint16) string {
     if len(ports) == 0 {
