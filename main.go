@@ -102,6 +102,12 @@ type SYSTEM_INFO struct {
     wProcessorRevision  uint16
 }
 
+// Settings structure for saving/loading
+type Settings struct {
+    RefreshDelay time.Duration
+    SortDelay    time.Duration
+}
+
 // --- Enhanced Data Structures ---
 type NetworkConnection struct {
     Protocol    string
@@ -163,6 +169,79 @@ var pidStartTimeCache = struct {
     m map[uint32]time.Time
 }{m: make(map[uint32]time.Time)}
 
+// --- Settings Management ---
+var appSettings = struct {
+    sync.RWMutex
+    s Settings
+}{s: Settings{
+    RefreshDelay: 2 * time.Second,
+    SortDelay:    500 * time.Millisecond,
+}}
+
+func saveSettings() error {
+    appSettings.RLock()
+    defer appSettings.RUnlock()
+    
+    // Simple settings file in the same directory as the executable
+    settingsFile := "gonet-top-settings.txt"
+    file, err := os.Create(settingsFile)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+    
+    _, err = fmt.Fprintf(file, "refresh_delay=%v\n", appSettings.s.RefreshDelay)
+    if err != nil {
+        return err
+    }
+    
+    _, err = fmt.Fprintf(file, "sort_delay=%v\n", appSettings.s.SortDelay)
+    if err != nil {
+        return err
+    }
+    
+    return nil
+}
+
+func loadSettings() error {
+    appSettings.Lock()
+    defer appSettings.Unlock()
+    
+    settingsFile := "gonet-top-settings.txt"
+    data, err := os.ReadFile(settingsFile)
+    if err != nil {
+        if os.IsNotExist(err) {
+            // Settings file doesn't exist, use defaults
+            return nil
+        }
+        return err
+    }
+    
+    lines := strings.Split(string(data), "\n")
+    for _, line := range lines {
+        line = strings.TrimSpace(line)
+        if strings.HasPrefix(line, "refresh_delay=") {
+            parts := strings.SplitN(line, "=", 2)
+            if len(parts) == 2 {
+                delayStr := strings.TrimSpace(parts[1])
+                if delay, err := time.ParseDuration(delayStr); err == nil {
+                    appSettings.s.RefreshDelay = delay
+                }
+            }
+        } else if strings.HasPrefix(line, "sort_delay=") {
+            parts := strings.SplitN(line, "=", 2)
+            if len(parts) == 2 {
+                delayStr := strings.TrimSpace(parts[1])
+                if delay, err := time.ParseDuration(delayStr); err == nil {
+                    appSettings.s.SortDelay = delay
+                }
+            }
+        }
+    }
+    
+    return nil
+}
+
 // --- Enhanced Bubble Tea Model ---
 type ProcessDisplayInfo struct {
     PID                uint32
@@ -215,14 +294,20 @@ type model struct {
 }
 
 func initialModel() model {
+    // Load settings from file
+    loadSettings()
+    
+    appSettings.RLock()
+    defer appSettings.RUnlock()
+    
     return model{
         lastUpdate:     time.Now(),
         selectedIdx:    0,
         showDetails:    false,
         viewMode:       0,
         sortBy:         0,
-        refreshDelay:   2 * time.Second,
-        sortDelay:      500 * time.Millisecond, // 500ms delay for sorting
+        refreshDelay:   appSettings.s.RefreshDelay,
+        sortDelay:      appSettings.s.SortDelay,
         showSettings:   false,
         pendingSort:    -1, // No pending sort
         width:          80,  // Default width
@@ -244,7 +329,8 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
     case tea.KeyMsg:
-        switch msg.String() {
+        key := strings.ToLower(msg.String())
+        switch key {
         case "ctrl+c", "q":
             // Signal goroutines to stop
             close(m.nameWatcherDone)
@@ -253,9 +339,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case "up", "k":
             if m.showSettings {
                 // In settings mode, adjust refresh delay
-                if m.refreshDelay < 10*time.Second {
-                    m.refreshDelay += time.Second
+                appSettings.Lock()
+                if appSettings.s.RefreshDelay < 10*time.Second {
+                    appSettings.s.RefreshDelay += time.Second
+                    m.refreshDelay = appSettings.s.RefreshDelay
                 }
+                appSettings.Unlock()
                 return m, nil
             } else if len(m.processes) > 0 && m.selectedIdx > 0 {
                 m.selectedIdx--
@@ -263,9 +352,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case "down", "j":
             if m.showSettings {
                 // In settings mode, adjust refresh delay
-                if m.refreshDelay > time.Second {
-                    m.refreshDelay -= time.Second
+                appSettings.Lock()
+                if appSettings.s.RefreshDelay > time.Second {
+                    appSettings.s.RefreshDelay -= time.Second
+                    m.refreshDelay = appSettings.s.RefreshDelay
                 }
+                appSettings.Unlock()
                 return m, nil
             } else if len(m.processes) > 0 && m.selectedIdx < len(m.processes)-1 {
                 m.selectedIdx++
@@ -273,17 +365,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case "left", "h":
             if m.showSettings {
                 // In settings mode, adjust sort delay
-                if m.sortDelay < 2*time.Second {
-                    m.sortDelay += 100 * time.Millisecond
+                appSettings.Lock()
+                if appSettings.s.SortDelay < 2*time.Second {
+                    appSettings.s.SortDelay += 100 * time.Millisecond
+                    m.sortDelay = appSettings.s.SortDelay
                 }
+                appSettings.Unlock()
                 return m, nil
             }
         case "right", "l":
             if m.showSettings {
                 // In settings mode, adjust sort delay
-                if m.sortDelay > 100*time.Millisecond {
-                    m.sortDelay -= 100 * time.Millisecond
+                appSettings.Lock()
+                if appSettings.s.SortDelay > 100*time.Millisecond {
+                    appSettings.s.SortDelay -= 100 * time.Millisecond
+                    m.sortDelay = appSettings.s.SortDelay
                 }
+                appSettings.Unlock()
                 return m, nil
             }
         case "enter", " ", "d":
@@ -302,13 +400,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             }
         case "tab":
             m.viewMode = (m.viewMode + 1) % 3
-        case "L": // Shift+L for lock
+        case "l": // Lowercase 'l' for lock
             if m.lockedProcess == -1 {
                 // Lock on the current process
                 if len(m.processes) > 0 && m.selectedIdx < len(m.processes) {
                     m.lockedProcess = int(m.processes[m.selectedIdx].PID)
                     m.viewMode = 1 // Switch to detailed view
-                    m.showDetails = true
+                    m.showDetails = false // Don't show details after locking
                 }
             } else {
                 // Unlock
@@ -330,6 +428,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 return checkPendingSortMsg{}
             })
         case "r":
+            if m.showSettings {
+                // Save settings when exiting settings mode
+                saveSettings()
+            }
             m.showSettings = !m.showSettings
         }
     case checkPendingSortMsg:
@@ -349,18 +451,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         // Don't update m.sortBy from the message, keep the current model value
         m.lastUpdate = time.Now()
         
-        // If we have a locked process, filter the processes list
+        // If we have a locked process, find it and move it to the top
         if m.lockedProcess != -1 {
-            var filteredProcesses []ProcessDisplayInfo
-            for _, p := range m.processes {
+            var lockedProcessIdx = -1
+            var lockedProcess ProcessDisplayInfo
+            
+            // Find the locked process
+            for i, p := range m.processes {
                 if int(p.PID) == m.lockedProcess {
-                    filteredProcesses = append(filteredProcesses, p)
+                    lockedProcessIdx = i
+                    lockedProcess = p
                     break
                 }
             }
-            m.processes = filteredProcesses
-            // Set selected index to 0 since there's only one process
-            m.selectedIdx = 0
+            
+            // If found, move it to the top
+            if lockedProcessIdx != -1 {
+                // Remove from current position
+                m.processes = append(m.processes[:lockedProcessIdx], m.processes[lockedProcessIdx+1:]...)
+                // Insert at the beginning
+                m.processes = append([]ProcessDisplayInfo{lockedProcess}, m.processes...)
+                // Set selected index to 0 since it's now at the top
+                m.selectedIdx = 0
+            } else {
+                // Process not found, unlock
+                m.lockedProcess = -1
+                // Keep selection in bounds
+                if len(m.processes) == 0 {
+                    m.selectedIdx = 0
+                } else if oldSelected >= len(m.processes) {
+                    m.selectedIdx = len(m.processes) - 1
+                } else {
+                    m.selectedIdx = oldSelected
+                }
+            }
         } else {
             // Keep selection in bounds with proper checks
             if len(m.processes) == 0 {
@@ -389,21 +513,12 @@ func (m model) View() string {
         doc.WriteString(fmt.Sprintf("🔒 LOCKED on PID %d\n\n", m.lockedProcess))
     }
     
-    // Show pending sort indicator if there's a pending sort
-    if m.pendingSort >= 0 {
-        timeSincePending := time.Since(m.pendingSortTime)
-        if timeSincePending < m.sortDelay {
-            remainingTime := m.sortDelay - timeSincePending
-            doc.WriteString(fmt.Sprintf("Sorting in %.1fs... (Press 's' to cancel)\n\n", remainingTime.Seconds()))
-        }
-    }
-    
     // Controls
     if m.showSettings {
-        doc.WriteString("Settings Mode - Refresh: ↑/↓=adjust, Sort Delay: ←/→=adjust, Enter=exit\n\n")
+        doc.WriteString("Settings Mode - Refresh: ↑/↓=adjust, Sort Delay: ←/→=adjust, Enter=save & exit\n\n")
         doc.WriteString(fmt.Sprintf("Current refresh delay: %v | Current sort delay: %v\n\n", m.refreshDelay, m.sortDelay))
     } else {
-        doc.WriteString("Controls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, L=lock, r=settings, q=quit\n\n")
+        doc.WriteString("Controls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, l=lock, r=settings, q=quit\n\n")
     }
     
     if len(m.processes) == 0 {
@@ -607,8 +722,8 @@ func (m model) renderDetailedView() string {
         doc.WriteString(row + "\n")
     }
     
-    // Show details for selected process only in detailed view
-    if m.viewMode == 1 && m.showDetails && m.selectedIdx < len(m.processes) {
+    // Show details for selected process only in detailed view and if not locked
+    if m.viewMode == 1 && m.showDetails && m.lockedProcess == -1 && m.selectedIdx < len(m.processes) {
         selected := m.processes[m.selectedIdx]
         doc.WriteString("\n")
         detailStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1).MarginTop(1)
@@ -1593,13 +1708,14 @@ func main() {
         fmt.Println("- Press 'r' to adjust refresh and sort delay settings")
         fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
         fmt.Println("- Press Enter or 'd' to toggle process details")
-        fmt.Println("- Press 'L' to lock/unlock on a process")
+        fmt.Println("- Press 'l' to lock/unlock on a process")
+        fmt.Println("- Settings are automatically saved")
         fmt.Println("\nStarting in 3 seconds...")
         time.Sleep(3 * time.Second)
         log.Println("Starting Enhanced Bubble Tea program (interactive mode)...")
         p = tea.NewProgram(initialModel(), tea.WithAltScreen())
     }
     if _, err := p.Run(); err != nil {
-        log.Fatalf("Error running program: %v", err)
+        log.Fatalf("Error running program: %v"
     }
 }
