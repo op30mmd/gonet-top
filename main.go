@@ -330,11 +330,11 @@ func (m model) renderPendingSortView() string {
     switch m.pendingSort {
     case 1: // Sort by upload rate
         sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortedProcesses[i].UploadRateValue > sortedProcesses[j].UploadRateValue
+            return sortByUploadRate(sortedProcesses[i], sortedProcesses[j])
         })
     case 2: // Sort by download rate
         sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortedProcesses[i].DownloadRateValue > sortedProcesses[j].DownloadRateValue
+            return sortByDownloadRate(sortedProcesses[i], sortedProcesses[j])
         })
     case 3: // Sort by process name
         sort.Slice(sortedProcesses, func(i, j int) bool {
@@ -346,7 +346,7 @@ func (m model) renderPendingSortView() string {
         })
     case 5: // Sort by total IO
         sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortedProcesses[i].TotalIO > sortedProcesses[j].TotalIO
+            return sortByTotalIO(sortedProcesses[i], sortedProcesses[j])
         })
     default: // Sort by total connections
         sort.Slice(sortedProcesses, func(i, j int) bool {
@@ -756,6 +756,58 @@ func ipFromUint32(addr uint32) string {
 func portFromUint32(port uint32) uint16 {
     return uint16((port&0xFF)<<8 | (port>>8)&0xFF)
 }
+// Helper functions for sorting with N/A values
+func sortByUploadRate(a, b ProcessDisplayInfo) bool {
+    // If both have IO data, sort by upload rate
+    if a.HasIOData && b.HasIOData {
+        return a.UploadRateValue > b.UploadRateValue
+    }
+    // If only a has IO data, it comes first
+    if a.HasIOData && !b.HasIOData {
+        return true
+    }
+    // If only b has IO data, it comes first
+    if !a.HasIOData && b.HasIOData {
+        return false
+    }
+    // If neither has IO data, sort by process name
+    return a.ProcessName < b.ProcessName
+}
+
+func sortByDownloadRate(a, b ProcessDisplayInfo) bool {
+    // If both have IO data, sort by download rate
+    if a.HasIOData && b.HasIOData {
+        return a.DownloadRateValue > b.DownloadRateValue
+    }
+    // If only a has IO data, it comes first
+    if a.HasIOData && !b.HasIOData {
+        return true
+    }
+    // If only b has IO data, it comes first
+    if !a.HasIOData && b.HasIOData {
+        return false
+    }
+    // If neither has IO data, sort by process name
+    return a.ProcessName < b.ProcessName
+}
+
+func sortByTotalIO(a, b ProcessDisplayInfo) bool {
+    // If both have IO data, sort by total IO
+    if a.HasIOData && b.HasIOData {
+        return a.TotalIO > b.TotalIO
+    }
+    // If only a has IO data, it comes first
+    if a.HasIOData && !b.HasIOData {
+        return true
+    }
+    // If only b has IO data, it comes first
+    if !a.HasIOData && b.HasIOData {
+        return false
+    }
+    // If neither has IO data, sort by process name
+    return a.ProcessName < b.ProcessName
+}
+
 func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
     tcpProcessMap, _, err := getTcpConnections()
     if err != nil {
@@ -897,19 +949,11 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
     switch sortBy {
     case 1: // Sort by upload rate
         sort.Slice(displayInfos, func(i, j int) bool {
-            // Put processes with IO data first, then sort by rate
-            if displayInfos[i].HasIOData != displayInfos[j].HasIOData {
-                return displayInfos[i].HasIOData
-            }
-            return displayInfos[i].UploadRateValue > displayInfos[j].UploadRateValue
+            return sortByUploadRate(displayInfos[i], displayInfos[j])
         })
     case 2: // Sort by download rate
         sort.Slice(displayInfos, func(i, j int) bool {
-            // Put processes with IO data first, then sort by rate
-            if displayInfos[i].HasIOData != displayInfos[j].HasIOData {
-                return displayInfos[i].HasIOData
-            }
-            return displayInfos[i].DownloadRateValue > displayInfos[j].DownloadRateValue
+            return sortByDownloadRate(displayInfos[i], displayInfos[j])
         })
     case 3: // Sort by process name
         sort.Slice(displayInfos, func(i, j int) bool {
@@ -921,11 +965,7 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         })
     case 5: // Sort by total IO
         sort.Slice(displayInfos, func(i, j int) bool {
-            // Put processes with IO data first, then sort by total IO
-            if displayInfos[i].HasIOData != displayInfos[j].HasIOData {
-                return displayInfos[i].HasIOData
-            }
-            return displayInfos[i].TotalIO > displayInfos[j].TotalIO
+            return sortByTotalIO(displayInfos[i], displayInfos[j])
         })
     default: // Sort by total connections
         sort.Slice(displayInfos, func(i, j int) bool {
