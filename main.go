@@ -434,7 +434,7 @@ func tick() tea.Cmd {
 func getProcessIoCounters(pid uint32) (IO_COUNTERS, error) {
     var ioCounters IO_COUNTERS
     
-    // Open the process
+    // Open the process with appropriate permissions
     handle, err := syscall.OpenProcess(syscall.PROCESS_QUERY_INFORMATION, false, pid)
     if err != nil {
         return ioCounters, err
@@ -548,7 +548,7 @@ func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
         if processMap[pid] == nil {
             processMap[pid] = &ProcessNetDetails{
                 PID:         pid,
-                RemoteHosts: make(map[string]uint32),
+                RemoteHosts: make(map[string]uint32]),
                 Connections: make([]NetworkConnection, 0),
             }
         }
@@ -648,20 +648,23 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         // Format listening ports
         listenPortsStr := formatPorts(details.ListenPorts)
         
-        // Get I/O counters for this process
+        // Get I/O counters for this process (with error handling)
         ioCounters, err := getProcessIoCounters(pid)
-        if err != nil {
-            log.Printf("Error getting I/O counters for PID %d: %v", pid, err)
-        }
-        
-        // Calculate rates if we have previous data
         var uploadRate, downloadRate float64
-        if prevDetails, ok := statsMap.m[pid]; ok {
-            timeDiff := now.Sub(prevDetails.PrevUpdate).Seconds()
-            if timeDiff > 0 {
-                uploadRate = float64(ioCounters.WriteTransferCount-prevDetails.PrevBytesSent) / timeDiff
-                downloadRate = float64(ioCounters.ReadTransferCount-prevDetails.PrevBytesReceived) / timeDiff
+        
+        if err == nil {
+            // Calculate rates if we have previous data
+            if prevDetails, ok := statsMap.m[pid]; ok {
+                timeDiff := now.Sub(prevDetails.PrevUpdate).Seconds()
+                if timeDiff > 0 {
+                    uploadRate = float64(ioCounters.WriteTransferCount-prevDetails.PrevBytesSent) / timeDiff
+                    downloadRate = float64(ioCounters.ReadTransferCount-prevDetails.PrevBytesReceived) / timeDiff
+                }
             }
+        } else {
+            // Silently handle I/O counter errors - don't log them as they're common
+            // for system processes and processes we don't have access to
+            ioCounters = IO_COUNTERS{} // Use zero values
         }
         
         displayInfos = append(displayInfos, ProcessDisplayInfo{
