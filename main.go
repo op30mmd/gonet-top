@@ -7,8 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -33,6 +36,22 @@ var (
 // TCP_TABLE_OWNER_PID_ALL constant
 const TCP_TABLE_OWNER_PID_ALL = 5
 const UDP_TABLE_OWNER_PID = 1
+
+// TCP connection states
+var tcpStates = map[uint32]string{
+	1:  "CLOSED",
+	2:  "LISTEN",
+	3:  "SYN_SENT",
+	4:  "SYN_RCVD",
+	5:  "ESTABLISHED",
+	6:  "FIN_WAIT1",
+	7:  "FIN_WAIT2",
+	8:  "CLOSE_WAIT",
+	9:  "CLOSING",
+	10: "LAST_ACK",
+	11: "TIME_WAIT",
+	12: "DELETE_TCB",
+}
 
 // MIB_TCPROW2 structure
 type MIB_TCPROW2 struct {
@@ -62,6 +81,34 @@ type MIB_UDPTABLE_OWNER_PID struct {
 	Table      [1]MIB_UDPROW_OWNER_PID
 }
 
+// --- Enhanced Data Structures ---
+
+type NetworkConnection struct {
+	Protocol    string
+	LocalAddr   string
+	LocalPort   uint16
+	RemoteAddr  string
+	RemotePort  uint16
+	State       string
+	PID         uint32
+}
+
+type ProcessNetDetails struct {
+	PID                uint32
+	ProcessName        string
+	TCPConns           uint32
+	UDPConns           uint32
+	ListenPorts        []uint16
+	EstablishedConns   uint32
+	RemoteHosts        map[string]uint32 // IP -> count
+	TopRemoteHost      string
+	TopRemoteHostConns uint32
+	BytesSent          uint64 // Placeholder - would need performance counters
+	BytesReceived      uint64 // Placeholder - would need performance counters
+	LastUpdate         time.Time
+	Connections        []NetworkConnection
+}
+
 // --- Admin Check ---
 
 func isAdmin() bool {
@@ -69,46 +116,47 @@ func isAdmin() bool {
 	return err == nil
 }
 
-// --- Data Structures ---
-
-type ProcessNetStats struct {
-	PID         uint32
-	ProcessName string
-	TCPConns    uint32
-	UDPConns    uint32
-	LastUpdate  time.Time
-}
-
 var statsMap = struct {
 	sync.RWMutex
-	m map[uint32]*ProcessNetStats
-}{m: make(map[uint32]*ProcessNetStats)}
+	m map[uint32]*ProcessNetDetails
+}{m: make(map[uint32]*ProcessNetDetails)}
 
 var pidNameCache = struct {
 	sync.RWMutex
 	m map[uint32]string
 }{m: make(map[uint32]string)}
 
-// --- Bubble Tea Model ---
+// --- Enhanced Bubble Tea Model ---
 
 type ProcessDisplayInfo struct {
-	PID         uint32
-	ProcessName string
-	TCPConns    uint32
-	UDPConns    uint32
-	TotalConns  uint32
+	PID                uint32
+	ProcessName        string
+	TCPConns           uint32
+	UDPConns           uint32
+	TotalConns         uint32
+	ListenPortsStr     string
+	EstablishedConns   uint32
+	TopRemoteHost      string
+	TopRemoteHostConns uint32
+	Connections        []NetworkConnection
 }
 
 type statsUpdatedMsg []ProcessDisplayInfo
 
 type model struct {
-	processes  []ProcessDisplayInfo
-	lastUpdate time.Time
+	processes   []ProcessDisplayInfo
+	lastUpdate  time.Time
+	selectedIdx int
+	showDetails bool
+	viewMode    int // 0: summary, 1: detailed, 2: connections view
 }
 
 func initialModel() model {
 	return model{
-		lastUpdate: time.Now(),
+		lastUpdate:  time.Now(),
+		selectedIdx: 0,
+		showDetails: false,
+		viewMode:    0,
 	}
 }
 
@@ -124,51 +172,227 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+		case "up", "k":
+			if m.selectedIdx > 0 {
+				m.selectedIdx--
+			}
+		case "down", "j":
+			if m.selectedIdx < len(m.processes)-1 {
+				m.selectedIdx++
+			}
+		case "enter", " ":
+			m.showDetails = !m.showDetails
+		case "tab":
+			m.viewMode = (m.viewMode + 1) % 3
+		case "d":
+			m.showDetails = !m.showDetails
 		}
 	case statsUpdatedMsg:
+		oldSelected := m.selectedIdx
 		m.processes = msg
 		m.lastUpdate = time.Now()
+		// Keep selection in bounds
+		if oldSelected >= len(m.processes) && len(m.processes) > 0 {
+			m.selectedIdx = len(m.processes) - 1
+		} else if len(m.processes) == 0 {
+			m.selectedIdx = 0
+		} else {
+			m.selectedIdx = oldSelected
+		}
 		return m, tick()
 	}
 	return m, nil
 }
 
 func (m model) View() string {
-	doc := "gonet-top - Network Connections by Process\n"
-	doc += fmt.Sprintf("Last updated: %s\n", m.lastUpdate.Format("15:04:05"))
-	doc += fmt.Sprintf("Active processes: %d\n\n", len(m.processes))
+	var doc strings.Builder
+	
+	// Header
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	doc.WriteString(headerStyle.Render("gonet-top - Enhanced Network Monitor"))
+	doc.WriteString(fmt.Sprintf(" | Mode: %s", m.getViewModeName()))
+	doc.WriteString(fmt.Sprintf(" | Last updated: %s\n", m.lastUpdate.Format("15:04:05")))
+	doc.WriteString(fmt.Sprintf("Active processes: %d | Selected: %d\n\n", len(m.processes), m.selectedIdx+1))
+
+	// Controls
+	controlStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	doc.WriteString(controlStyle.Render("Controls: ↑/↓ or j/k=navigate, Enter/d=details, Tab=view mode, q=quit\n\n"))
+
+	if len(m.processes) == 0 {
+		doc.WriteString("No network connections detected...\n")
+		doc.WriteString("Try browsing the web or starting network applications.\n")
+		return doc.String()
+	}
+
+	switch m.viewMode {
+	case 0:
+		return doc.String() + m.renderSummaryView()
+	case 1:
+		return doc.String() + m.renderDetailedView()
+	case 2:
+		return doc.String() + m.renderConnectionsView()
+	default:
+		return doc.String() + m.renderSummaryView()
+	}
+}
+
+func (m model) getViewModeName() string {
+	switch m.viewMode {
+	case 0:
+		return "Summary"
+	case 1:
+		return "Detailed"
+	case 2:
+		return "Connections"
+	default:
+		return "Unknown"
+	}
+}
+
+func (m model) renderSummaryView() string {
+	var doc strings.Builder
+	
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
+	cellStyle := lipgloss.NewStyle().Padding(0, 1)
+	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
+
+	headers := []string{"PID", "Process Name", "TCP", "UDP", "Total", "Listen Ports"}
+	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
+		headerStyle.Copy().Width(8).Render(headers[0]),
+		headerStyle.Copy().Width(20).Render(headers[1]),
+		headerStyle.Copy().Width(6).Render(headers[2]),
+		headerStyle.Copy().Width(6).Render(headers[3]),
+		headerStyle.Copy().Width(6).Render(headers[4]),
+		headerStyle.Copy().Width(30).Render(headers[5]),
+	)
+	doc.WriteString(headerRow + "\n")
+
+	for i, p := range m.processes {
+		style := cellStyle
+		if i == m.selectedIdx {
+			style = selectedStyle
+		}
+
+		row := lipgloss.JoinHorizontal(lipgloss.Left,
+			style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
+			style.Copy().Width(20).Render(truncateString(p.ProcessName, 18)),
+			style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TCPConns)),
+			style.Copy().Width(6).Render(fmt.Sprintf("%d", p.UDPConns)),
+			style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TotalConns)),
+			style.Copy().Width(30).Render(truncateString(p.ListenPortsStr, 28)),
+		)
+		doc.WriteString(row + "\n")
+	}
+
+	return doc.String()
+}
+
+func (m model) renderDetailedView() string {
+	var doc strings.Builder
+	
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
+	cellStyle := lipgloss.NewStyle().Padding(0, 1)
+	selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
+
+	headers := []string{"PID", "Process", "TCP", "UDP", "EST", "Top Remote", "Count"}
+	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
+		headerStyle.Copy().Width(8).Render(headers[0]),
+		headerStyle.Copy().Width(16).Render(headers[1]),
+		headerStyle.Copy().Width(5).Render(headers[2]),
+		headerStyle.Copy().Width(5).Render(headers[3]),
+		headerStyle.Copy().Width(5).Render(headers[4]),
+		headerStyle.Copy().Width(16).Render(headers[5]),
+		headerStyle.Copy().Width(5).Render(headers[6]),
+	)
+	doc.WriteString(headerRow + "\n")
+
+	for i, p := range m.processes {
+		style := cellStyle
+		if i == m.selectedIdx {
+			style = selectedStyle
+		}
+
+		row := lipgloss.JoinHorizontal(lipgloss.Left,
+			style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
+			style.Copy().Width(16).Render(truncateString(p.ProcessName, 14)),
+			style.Copy().Width(5).Render(fmt.Sprintf("%d", p.TCPConns)),
+			style.Copy().Width(5).Render(fmt.Sprintf("%d", p.UDPConns)),
+			style.Copy().Width(5).Render(fmt.Sprintf("%d", p.EstablishedConns)),
+			style.Copy().Width(16).Render(truncateString(p.TopRemoteHost, 14)),
+			style.Copy().Width(5).Render(fmt.Sprintf("%d", p.TopRemoteHostConns)),
+		)
+		doc.WriteString(row + "\n")
+	}
+
+	// Show details for selected process
+	if m.showDetails && m.selectedIdx < len(m.processes) {
+		selected := m.processes[m.selectedIdx]
+		doc.WriteString("\n")
+		detailStyle := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1).MarginTop(1)
+		
+		var details strings.Builder
+		details.WriteString(fmt.Sprintf("Process Details: %s (PID %d)\n", selected.ProcessName, selected.PID))
+		details.WriteString(fmt.Sprintf("TCP Connections: %d | UDP Connections: %d\n", selected.TCPConns, selected.UDPConns))
+		details.WriteString(fmt.Sprintf("Established Connections: %d\n", selected.EstablishedConns))
+		details.WriteString(fmt.Sprintf("Listen Ports: %s\n", selected.ListenPortsStr))
+		if selected.TopRemoteHost != "" {
+			details.WriteString(fmt.Sprintf("Top Remote Host: %s (%d connections)\n", selected.TopRemoteHost, selected.TopRemoteHostConns))
+		}
+		
+		doc.WriteString(detailStyle.Render(details.String()))
+	}
+
+	return doc.String()
+}
+
+func (m model) renderConnectionsView() string {
+	var doc strings.Builder
+	
+	if m.selectedIdx >= len(m.processes) {
+		doc.WriteString("No process selected\n")
+		return doc.String()
+	}
+
+	selected := m.processes[m.selectedIdx]
+	
+	titleStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	doc.WriteString(titleStyle.Render(fmt.Sprintf("Active Connections for %s (PID %d)", selected.ProcessName, selected.PID)))
+	doc.WriteString("\n\n")
+
+	if len(selected.Connections) == 0 {
+		doc.WriteString("No active connections found for this process.\n")
+		return doc.String()
+	}
 
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
 	cellStyle := lipgloss.NewStyle().Padding(0, 1)
 
-	headers := []string{"PID", "Process Name", "TCP Conns", "UDP Conns", "Total"}
+	headers := []string{"Protocol", "Local Address", "Remote Address", "State"}
 	headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
 		headerStyle.Copy().Width(8).Render(headers[0]),
-		headerStyle.Copy().Width(25).Render(headers[1]),
-		headerStyle.Copy().Width(12).Render(headers[2]),
+		headerStyle.Copy().Width(22).Render(headers[1]),
+		headerStyle.Copy().Width(22).Render(headers[2]),
 		headerStyle.Copy().Width(12).Render(headers[3]),
-		headerStyle.Copy().Width(12).Render(headers[4]),
 	)
-	doc += headerRow + "\n"
+	doc.WriteString(headerRow + "\n")
 
-	if len(m.processes) == 0 {
-		doc += "No network connections detected...\n"
-		doc += "Try browsing the web or starting network applications.\n"
-	} else {
-		for _, p := range m.processes {
-			row := lipgloss.JoinHorizontal(lipgloss.Left,
-				cellStyle.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
-				cellStyle.Copy().Width(25).Render(truncateString(p.ProcessName, 23)),
-				cellStyle.Copy().Width(12).Render(fmt.Sprintf("%d", p.TCPConns)),
-				cellStyle.Copy().Width(12).Render(fmt.Sprintf("%d", p.UDPConns)),
-				cellStyle.Copy().Width(12).Render(fmt.Sprintf("%d", p.TotalConns)),
-			)
-			doc += row + "\n"
+	for _, conn := range selected.Connections {
+		localAddr := fmt.Sprintf("%s:%d", conn.LocalAddr, conn.LocalPort)
+		remoteAddr := fmt.Sprintf("%s:%d", conn.RemoteAddr, conn.RemotePort)
+		if conn.Protocol == "UDP" {
+			remoteAddr = "*:*"
 		}
+
+		row := lipgloss.JoinHorizontal(lipgloss.Left,
+			cellStyle.Copy().Width(8).Render(conn.Protocol),
+			cellStyle.Copy().Width(22).Render(truncateString(localAddr, 20)),
+			cellStyle.Copy().Width(22).Render(truncateString(remoteAddr, 20)),
+			cellStyle.Copy().Width(12).Render(conn.State),
+		)
+		doc.WriteString(row + "\n")
 	}
 
-	doc += "\n\nPress 'q' or 'ctrl+c' to quit."
-	return doc
+	return doc.String()
 }
 
 func truncateString(s string, maxLen int) string {
@@ -182,21 +406,22 @@ func truncateString(s string, maxLen int) string {
 
 func tick() tea.Cmd {
 	return tea.Tick(time.Second*3, func(t time.Time) tea.Msg {
-		return getNetworkStats()
+		return getEnhancedNetworkStats()
 	})
 }
 
-// --- Network Connection Monitoring ---
+// --- Enhanced Network Connection Monitoring ---
 
-func getTcpConnections() (map[uint32]uint32, error) {
-	connections := make(map[uint32]uint32)
+func getTcpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, error) {
+	processMap := make(map[uint32]*ProcessNetDetails)
+	var allConnections []NetworkConnection
 
 	// Get buffer size
 	var bufSize uint32
 	ret, _, _ := procGetTcpTable2.Call(0, uintptr(unsafe.Pointer(&bufSize)), 0, TCP_TABLE_OWNER_PID_ALL)
 
 	if ret != 122 { // ERROR_INSUFFICIENT_BUFFER
-		return nil, fmt.Errorf("failed to get TCP table size: %d", ret)
+		return nil, nil, fmt.Errorf("failed to get TCP table size: %d", ret)
 	}
 
 	// Allocate buffer
@@ -209,7 +434,7 @@ func getTcpConnections() (map[uint32]uint32, error) {
 	)
 
 	if ret != 0 {
-		return nil, fmt.Errorf("failed to get TCP table: %d", ret)
+		return nil, nil, fmt.Errorf("failed to get TCP table: %d", ret)
 	}
 
 	// Parse table
@@ -217,21 +442,70 @@ func getTcpConnections() (map[uint32]uint32, error) {
 	tableSlice := (*[1024 * 1024]MIB_TCPROW2)(unsafe.Pointer(&table.Table[0]))[:table.NumEntries:table.NumEntries]
 
 	for _, row := range tableSlice {
-		connections[row.OwningPid]++
+		pid := row.OwningPid
+		
+		if processMap[pid] == nil {
+			processMap[pid] = &ProcessNetDetails{
+				PID:         pid,
+				RemoteHosts: make(map[string]uint32),
+				Connections: make([]NetworkConnection, 0),
+			}
+		}
+
+		processMap[pid].TCPConns++
+
+		// Convert addresses
+		localIP := ipFromUint32(row.LocalAddr)
+		remoteIP := ipFromUint32(row.RemoteAddr)
+		localPort := portFromUint32(row.LocalPort)
+		remotePort := portFromUint32(row.RemotePort)
+
+		state, ok := tcpStates[row.State]
+		if !ok {
+			state = fmt.Sprintf("UNKNOWN(%d)", row.State)
+		}
+
+		// Count established connections
+		if row.State == 5 { // ESTABLISHED
+			processMap[pid].EstablishedConns++
+			if remoteIP != "0.0.0.0" {
+				processMap[pid].RemoteHosts[remoteIP]++
+			}
+		}
+
+		// Count listening ports
+		if row.State == 2 { // LISTEN
+			processMap[pid].ListenPorts = append(processMap[pid].ListenPorts, localPort)
+		}
+
+		// Create connection record
+		conn := NetworkConnection{
+			Protocol:   "TCP",
+			LocalAddr:  localIP,
+			LocalPort:  localPort,
+			RemoteAddr: remoteIP,
+			RemotePort: remotePort,
+			State:      state,
+			PID:        pid,
+		}
+
+		processMap[pid].Connections = append(processMap[pid].Connections, conn)
+		allConnections = append(allConnections, conn)
 	}
 
-	return connections, nil
+	return processMap, allConnections, nil
 }
 
-func getUdpConnections() (map[uint32]uint32, error) {
-	connections := make(map[uint32]uint32)
+func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, error) {
+	processMap := make(map[uint32]*ProcessNetDetails)
+	var allConnections []NetworkConnection
 
 	// Get buffer size
 	var bufSize uint32
 	ret, _, _ := procGetUdpTable.Call(0, uintptr(unsafe.Pointer(&bufSize)), 0, UDP_TABLE_OWNER_PID)
 
 	if ret != 122 { // ERROR_INSUFFICIENT_BUFFER
-		return nil, fmt.Errorf("failed to get UDP table size: %d", ret)
+		return nil, nil, fmt.Errorf("failed to get UDP table size: %d", ret)
 	}
 
 	// Allocate buffer
@@ -244,7 +518,7 @@ func getUdpConnections() (map[uint32]uint32, error) {
 	)
 
 	if ret != 0 {
-		return nil, fmt.Errorf("failed to get UDP table: %d", ret)
+		return nil, nil, fmt.Errorf("failed to get UDP table: %d", ret)
 	}
 
 	// Parse table
@@ -252,31 +526,74 @@ func getUdpConnections() (map[uint32]uint32, error) {
 	tableSlice := (*[1024 * 1024]MIB_UDPROW_OWNER_PID)(unsafe.Pointer(&table.Table[0]))[:table.NumEntries:table.NumEntries]
 
 	for _, row := range tableSlice {
-		connections[row.OwningPid]++
+		pid := row.OwningPid
+		
+		if processMap[pid] == nil {
+			processMap[pid] = &ProcessNetDetails{
+				PID:         pid,
+				RemoteHosts: make(map[string]uint32),
+				Connections: make([]NetworkConnection, 0),
+			}
+		}
+
+		processMap[pid].UDPConns++
+
+		// Convert addresses
+		localIP := ipFromUint32(row.LocalAddr)
+		localPort := portFromUint32(row.LocalPort)
+
+		// UDP listening port
+		processMap[pid].ListenPorts = append(processMap[pid].ListenPorts, localPort)
+
+		// Create connection record
+		conn := NetworkConnection{
+			Protocol:   "UDP",
+			LocalAddr:  localIP,
+			LocalPort:  localPort,
+			RemoteAddr: "*",
+			RemotePort: 0,
+			State:      "LISTEN",
+			PID:        pid,
+		}
+
+		processMap[pid].Connections = append(processMap[pid].Connections, conn)
+		allConnections = append(allConnections, conn)
 	}
 
-	return connections, nil
+	return processMap, allConnections, nil
 }
 
-func getNetworkStats() statsUpdatedMsg {
-	tcpConns, err := getTcpConnections()
+func ipFromUint32(addr uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d",
+		addr&0xFF,
+		(addr>>8)&0xFF,
+		(addr>>16)&0xFF,
+		(addr>>24)&0xFF)
+}
+
+func portFromUint32(port uint32) uint16 {
+	return uint16((port&0xFF)<<8 | (port>>8)&0xFF)
+}
+
+func getEnhancedNetworkStats() statsUpdatedMsg {
+	tcpProcessMap, _, err := getTcpConnections()
 	if err != nil {
 		log.Printf("Error getting TCP connections: %v", err)
-		tcpConns = make(map[uint32]uint32)
+		tcpProcessMap = make(map[uint32]*ProcessNetDetails)
 	}
 
-	udpConns, err := getUdpConnections()
+	udpProcessMap, _, err := getUdpConnections()
 	if err != nil {
 		log.Printf("Error getting UDP connections: %v", err)
-		udpConns = make(map[uint32]uint32)
+		udpProcessMap = make(map[uint32]*ProcessNetDetails)
 	}
 
 	// Combine all PIDs
 	allPids := make(map[uint32]bool)
-	for pid := range tcpConns {
+	for pid := range tcpProcessMap {
 		allPids[pid] = true
 	}
-	for pid := range udpConns {
+	for pid := range udpProcessMap {
 		allPids[pid] = true
 	}
 
@@ -286,9 +603,21 @@ func getNetworkStats() statsUpdatedMsg {
 	var displayInfos []ProcessDisplayInfo
 
 	for pid := range allPids {
-		tcpCount := tcpConns[pid]
-		udpCount := udpConns[pid]
-		totalCount := tcpCount + udpCount
+		var details ProcessNetDetails
+		var connections []NetworkConnection
+
+		// Merge TCP and UDP data
+		if tcpData, ok := tcpProcessMap[pid]; ok {
+			details = *tcpData
+			connections = append(connections, tcpData.Connections...)
+		}
+		if udpData, ok := udpProcessMap[pid]; ok {
+			details.UDPConns = udpData.UDPConns
+			details.ListenPorts = append(details.ListenPorts, udpData.ListenPorts...)
+			connections = append(connections, udpData.Connections...)
+		}
+
+		totalCount := details.TCPConns + details.UDPConns
 
 		// Skip processes with no connections
 		if totalCount == 0 {
@@ -300,12 +629,30 @@ func getNetworkStats() statsUpdatedMsg {
 			name = fmt.Sprintf("PID-%d", pid)
 		}
 
+		// Find top remote host
+		var topRemoteHost string
+		var topRemoteHostConns uint32
+		for ip, count := range details.RemoteHosts {
+			if count > topRemoteHostConns {
+				topRemoteHost = ip
+				topRemoteHostConns = count
+			}
+		}
+
+		// Format listening ports
+		listenPortsStr := formatPorts(details.ListenPorts)
+
 		displayInfos = append(displayInfos, ProcessDisplayInfo{
-			PID:         pid,
-			ProcessName: name,
-			TCPConns:    tcpCount,
-			UDPConns:    udpCount,
-			TotalConns:  totalCount,
+			PID:                pid,
+			ProcessName:        name,
+			TCPConns:           details.TCPConns,
+			UDPConns:           details.UDPConns,
+			TotalConns:         totalCount,
+			ListenPortsStr:     listenPortsStr,
+			EstablishedConns:   details.EstablishedConns,
+			TopRemoteHost:      topRemoteHost,
+			TopRemoteHostConns: topRemoteHostConns,
+			Connections:        connections,
 		})
 	}
 
@@ -314,24 +661,58 @@ func getNetworkStats() statsUpdatedMsg {
 		return displayInfos[i].TotalConns > displayInfos[j].TotalConns
 	})
 
-	// Limit to top 20 processes
-	if len(displayInfos) > 20 {
-		displayInfos = displayInfos[:20]
+	// Limit to top 50 processes to avoid overwhelming display
+	if len(displayInfos) > 50 {
+		displayInfos = displayInfos[:50]
 	}
 
 	return statsUpdatedMsg(displayInfos)
 }
 
+func formatPorts(ports []uint16) string {
+	if len(ports) == 0 {
+		return "-"
+	}
+
+	// Remove duplicates and sort
+	portMap := make(map[uint16]bool)
+	for _, port := range ports {
+		portMap[port] = true
+	}
+
+	var uniquePorts []uint16
+	for port := range portMap {
+		uniquePorts = append(uniquePorts, port)
+	}
+
+	sort.Slice(uniquePorts, func(i, j int) bool {
+		return uniquePorts[i] < uniquePorts[j]
+	})
+
+	// Format as string, limit to prevent overflow
+	var portStrs []string
+	maxPorts := 5 // Show max 5 ports
+	for i, port := range uniquePorts {
+		if i >= maxPorts {
+			portStrs = append(portStrs, "...")
+			break
+		}
+		portStrs = append(portStrs, strconv.Itoa(int(port)))
+	}
+
+	return strings.Join(portStrs, ",")
+}
+
 // --- Debug Functions ---
 
 func showDebugStats() {
-	tcpConns, err := getTcpConnections()
+	tcpProcessMap, _, err := getTcpConnections()
 	if err != nil {
 		fmt.Printf("Error getting TCP connections: %v\n", err)
 		return
 	}
 
-	udpConns, err := getUdpConnections()
+	udpProcessMap, _, err := getUdpConnections()
 	if err != nil {
 		fmt.Printf("Error getting UDP connections: %v\n", err)
 		return
@@ -340,14 +721,14 @@ func showDebugStats() {
 	pidNameCache.RLock()
 	defer pidNameCache.RUnlock()
 
-	fmt.Println("\n=== Current Network Connections ===")
+	fmt.Println("\n=== Enhanced Network Connections ===")
 
 	// Combine all PIDs
 	allPids := make(map[uint32]bool)
-	for pid := range tcpConns {
+	for pid := range tcpProcessMap {
 		allPids[pid] = true
 	}
-	for pid := range udpConns {
+	for pid := range udpProcessMap {
 		allPids[pid] = true
 	}
 
@@ -362,12 +743,38 @@ func showDebugStats() {
 			name = fmt.Sprintf("PID-%d", pid)
 		}
 
-		tcpCount := tcpConns[pid]
-		udpCount := udpConns[pid]
-		fmt.Printf("PID %d (%s): TCP=%d, UDP=%d, Total=%d\n",
-			pid, name, tcpCount, udpCount, tcpCount+udpCount)
+		var tcpCount, udpCount, establishedCount uint32
+		var listenPorts []uint16
+		var topRemote string
+		var topRemoteCount uint32
+
+		if tcpData, ok := tcpProcessMap[pid]; ok {
+			tcpCount = tcpData.TCPConns
+			establishedCount = tcpData.EstablishedConns
+			listenPorts = append(listenPorts, tcpData.ListenPorts...)
+			
+			for ip, count := range tcpData.RemoteHosts {
+				if count > topRemoteCount {
+					topRemote = ip
+					topRemoteCount = count
+				}
+			}
+		}
+		
+		if udpData, ok := udpProcessMap[pid]; ok {
+			udpCount = udpData.UDPConns
+			listenPorts = append(listenPorts, udpData.ListenPorts...)
+		}
+
+		fmt.Printf("PID %d (%s):\n", pid, name)
+		fmt.Printf("  TCP=%d, UDP=%d, Established=%d\n", tcpCount, udpCount, establishedCount)
+		fmt.Printf("  Listen ports: %s\n", formatPorts(listenPorts))
+		if topRemote != "" {
+			fmt.Printf("  Top remote: %s (%d conns)\n", topRemote, topRemoteCount)
+		}
+		fmt.Println()
 	}
-	fmt.Println("===================================")
+	fmt.Println("=====================================")
 }
 
 // --- Process Name Discovery ---
@@ -408,14 +815,14 @@ func startProcessNameWatcher() {
 }
 
 func startNetworkMonitor() {
-	log.Println("Starting network connection monitor...")
+	log.Println("Starting enhanced network connection monitor...")
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		<-ticker.C
-		// The actual monitoring happens in getNetworkStats()
+		// The actual monitoring happens in getEnhancedNetworkStats()
 		// which is called by the tick() function
 	}
 }
@@ -451,7 +858,7 @@ func main() {
 		log.SetOutput(os.Stderr)
 	}
 
-	log.Println("Starting gonet-top (Performance Counter version)...")
+	log.Println("Starting gonet-top (Enhanced version)...")
 
 	if !isAdmin() {
 		log.Println("Note: Some network information may be limited without administrator privileges.")
@@ -462,7 +869,7 @@ func main() {
 	}
 
 	if *debugMode {
-		fmt.Println("Debug mode enabled - Network connections will be logged to console")
+		fmt.Println("Enhanced Debug mode enabled - Detailed network connections will be logged to console")
 		fmt.Println("Press Ctrl+C to exit")
 
 		// In debug mode, just show network stats periodically
@@ -488,13 +895,20 @@ func main() {
 			log.Fatalf("Failed to open TUI log file: %v", err)
 		}
 		defer tuiLogFile.Close()
-		log.Println("Starting Bubble Tea program (CI mode)...")
+		log.Println("Starting Enhanced Bubble Tea program (CI mode)...")
 		p = tea.NewProgram(initialModel(), tea.WithOutput(tuiLogFile), tea.WithAltScreen())
 	} else {
 		// In normal environment, use standard terminal
-		fmt.Println("Starting gonet-top... (Run with -debug flag to see connection logs)")
-		time.Sleep(2 * time.Second)
-		log.Println("Starting Bubble Tea program (interactive mode)...")
+		fmt.Println("Starting enhanced gonet-top...")
+		fmt.Println("Features:")
+		fmt.Println("- Summary view: Basic connection counts and listening ports")
+		fmt.Println("- Detailed view: Shows established connections and top remote hosts")
+		fmt.Println("- Connections view: Lists all active connections for selected process")
+		fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
+		fmt.Println("- Press Enter or 'd' to toggle process details")
+		fmt.Println("\nStarting in 3 seconds...")
+		time.Sleep(3 * time.Second)
+		log.Println("Starting Enhanced Bubble Tea program (interactive mode)...")
 		p = tea.NewProgram(initialModel(), tea.WithAltScreen())
 	}
 
@@ -502,3 +916,5 @@ func main() {
 		log.Fatalf("Error running program: %v", err)
 	}
 }
+
+//
