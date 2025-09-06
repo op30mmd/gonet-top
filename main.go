@@ -270,9 +270,9 @@ func (m model) View() string {
         if timeSincePending >= m.sortDelay {
             // Apply the pending sort
             m.sortBy = m.pendingSort
-            m.pendingSort = -1
-            // Trigger a refresh with the new sort
-            return doc.String() + m.renderPendingSortView()
+            m.pendingSort = -1 // Reset pending sort
+            // Return a command to refresh with the new sort
+            return doc.String()
         } else {
             // Show pending sort indicator
             remainingTime := m.sortDelay - timeSincePending
