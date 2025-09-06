@@ -107,6 +107,7 @@ type ProcessNetDetails struct {
     PrevUpdate         time.Time
     UploadRate         float64 // bytes per second
     DownloadRate       float64 // bytes per second
+    HasIOData          bool    // Flag to indicate if we successfully got IO data
 }
 // --- Admin Check ---
 func isAdmin() bool {
@@ -134,12 +135,13 @@ type ProcessDisplayInfo struct {
     TopRemoteHostConns uint32
     UploadRate         string // Formatted string
     DownloadRate       string // Formatted string
-    TotalBytesSent     uint64
-    TotalBytesReceived uint64
+    TotalBytesSent     string // Formatted string
+    TotalBytesReceived string // Formatted string
     Connections        []NetworkConnection
     UploadRateValue    float64 // For sorting
     DownloadRateValue  float64 // For sorting
     TotalIO            uint64  // For sorting (total bytes in + out)
+    HasIOData          bool    // Flag to indicate if we successfully got IO data
 }
 type statsUpdatedMsg struct {
     processes []ProcessDisplayInfo
@@ -508,7 +510,7 @@ func (m model) renderDetailedView() string {
         details.WriteString(fmt.Sprintf("Established Connections: %d\n", selected.EstablishedConns))
         details.WriteString(fmt.Sprintf("Upload Rate: %s/s | Download Rate: %s/s\n", selected.UploadRate, selected.DownloadRate))
         details.WriteString(fmt.Sprintf("Total Bytes Sent: %s | Total Bytes Received: %s\n", 
-            formatBytes(selected.TotalBytesSent), formatBytes(selected.TotalBytesReceived)))
+            selected.TotalBytesSent, selected.TotalBytesReceived))
         details.WriteString(fmt.Sprintf("Listen Ports: %s\n", selected.ListenPortsStr))
         if selected.TopRemoteHost != "" {
             details.WriteString(fmt.Sprintf("Top Remote Host: %s (%d connections)\n", selected.TopRemoteHost, selected.TopRemoteHostConns))
@@ -532,7 +534,7 @@ func (m model) renderConnectionsView() string {
     doc.WriteString("\n\n")
     doc.WriteString(fmt.Sprintf("Upload: %s/s | Download: %s/s\n", selected.UploadRate, selected.DownloadRate))
     doc.WriteString(fmt.Sprintf("Total Sent: %s | Total Received: %s\n\n", 
-        formatBytes(selected.TotalBytesSent), formatBytes(selected.TotalBytesReceived)))
+        selected.TotalBytesSent, selected.TotalBytesReceived))
     
     if len(selected.Connections) == 0 {
         doc.WriteString("No active connections found for this process.\n")
@@ -822,10 +824,11 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         // Get I/O counters for this process (with error handling)
         ioCounters, err := getProcessIoCounters(pid)
         var uploadRate, downloadRate float64
+        hasIOData := err == nil
         
-        if err == nil {
+        if hasIOData {
             // Calculate rates if we have previous data
-            if prevDetails, ok := statsMap.m[pid]; ok {
+            if prevDetails, ok := statsMap.m[pid]; ok && prevDetails.HasIOData {
                 timeDiff := now.Sub(prevDetails.PrevUpdate).Seconds()
                 if timeDiff > 0 {
                     uploadRate = float64(ioCounters.WriteTransferCount-prevDetails.PrevBytesSent) / timeDiff
@@ -840,6 +843,20 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         
         totalIO := ioCounters.ReadTransferCount + ioCounters.WriteTransferCount
         
+        // Format values for display, showing "N/A" for unavailable data
+        var uploadRateStr, downloadRateStr, totalBytesSentStr, totalBytesReceivedStr string
+        if hasIOData {
+            uploadRateStr = formatBytesPerSecond(uploadRate)
+            downloadRateStr = formatBytesPerSecond(downloadRate)
+            totalBytesSentStr = formatBytes(ioCounters.WriteTransferCount)
+            totalBytesReceivedStr = formatBytes(ioCounters.ReadTransferCount)
+        } else {
+            uploadRateStr = "N/A"
+            downloadRateStr = "N/A"
+            totalBytesSentStr = "N/A"
+            totalBytesReceivedStr = "N/A"
+        }
+        
         displayInfos = append(displayInfos, ProcessDisplayInfo{
             PID:                pid,
             ProcessName:        name,
@@ -850,14 +867,15 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
             EstablishedConns:   details.EstablishedConns,
             TopRemoteHost:      topRemoteHost,
             TopRemoteHostConns: topRemoteHostConns,
-            UploadRate:         formatBytesPerSecond(uploadRate),
-            DownloadRate:       formatBytesPerSecond(downloadRate),
-            TotalBytesSent:     ioCounters.WriteTransferCount,
-            TotalBytesReceived: ioCounters.ReadTransferCount,
+            UploadRate:         uploadRateStr,
+            DownloadRate:       downloadRateStr,
+            TotalBytesSent:     totalBytesSentStr,
+            TotalBytesReceived: totalBytesReceivedStr,
             Connections:        connections,
             UploadRateValue:    uploadRate,
             DownloadRateValue:  downloadRate,
             TotalIO:            totalIO,
+            HasIOData:          hasIOData,
         })
         
         // Update the stats map with current values for next calculation
@@ -869,6 +887,7 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         details.LastUpdate = now
         details.UploadRate = uploadRate
         details.DownloadRate = downloadRate
+        details.HasIOData = hasIOData
         
         statsMap.m[pid] = &details
     }
@@ -878,10 +897,18 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
     switch sortBy {
     case 1: // Sort by upload rate
         sort.Slice(displayInfos, func(i, j int) bool {
+            // Put processes with IO data first, then sort by rate
+            if displayInfos[i].HasIOData != displayInfos[j].HasIOData {
+                return displayInfos[i].HasIOData
+            }
             return displayInfos[i].UploadRateValue > displayInfos[j].UploadRateValue
         })
     case 2: // Sort by download rate
         sort.Slice(displayInfos, func(i, j int) bool {
+            // Put processes with IO data first, then sort by rate
+            if displayInfos[i].HasIOData != displayInfos[j].HasIOData {
+                return displayInfos[i].HasIOData
+            }
             return displayInfos[i].DownloadRateValue > displayInfos[j].DownloadRateValue
         })
     case 3: // Sort by process name
@@ -894,6 +921,10 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         })
     case 5: // Sort by total IO
         sort.Slice(displayInfos, func(i, j int) bool {
+            // Put processes with IO data first, then sort by total IO
+            if displayInfos[i].HasIOData != displayInfos[j].HasIOData {
+                return displayInfos[i].HasIOData
+            }
             return displayInfos[i].TotalIO > displayInfos[j].TotalIO
         })
     default: // Sort by total connections
@@ -1126,6 +1157,7 @@ func main() {
         fmt.Println("- Connections view: Lists all active connections for selected process")
         fmt.Println("- Sort options: connections, upload rate, download rate, process name, PID, total IO")
         fmt.Println("- Delayed sorting with configurable delay time")
+        fmt.Println("- Shows 'N/A' for data that cannot be accessed due to permissions")
         fmt.Println("- Press 'r' to adjust refresh and sort delay settings")
         fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
         fmt.Println("- Press Enter or 'd' to toggle process details")
