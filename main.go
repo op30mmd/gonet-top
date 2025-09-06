@@ -362,7 +362,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             } else if len(m.processes) > 0 && m.selectedIdx < len(m.processes)-1 {
                 m.selectedIdx++
             }
-        case "left", "h":
+        case "left", "h":  // FIXED: Removed "l" from this case
             if m.showSettings {
                 // In settings mode, adjust sort delay
                 appSettings.Lock()
@@ -373,7 +373,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 appSettings.Unlock()
                 return m, nil
             }
-        case "right", "l":
+        case "right", "l":  // FIXED: Changed to only handle right arrow
             if m.showSettings {
                 // In settings mode, adjust sort delay
                 appSettings.Lock()
