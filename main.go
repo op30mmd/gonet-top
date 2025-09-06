@@ -194,7 +194,6 @@ type statsUpdatedMsg struct {
 }
 
 type checkPendingSortMsg struct{}
-type cancelPendingSortMsg struct{}
 
 type model struct {
     processes      []ProcessDisplayInfo
@@ -298,12 +297,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
         case "d":
             m.showDetails = !m.showDetails
         case "s":
-            // If there's already a pending sort, cancel it first
-            if m.pendingSort >= 0 {
-                m.pendingSort = -1
-                return m, nil
-            }
-            
             // Set a pending sort instead of immediately sorting
             newSort := (m.sortBy + 1) % 6 // Now 6 sort options (0-5)
             m.pendingSort = newSort
@@ -318,17 +311,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     case checkPendingSortMsg:
         // Check if we should apply the pending sort
         if m.pendingSort >= 0 {
-            // Check if the pending sort is still valid (not too old)
-            timeSincePending := time.Since(m.pendingSortTime)
-            if timeSincePending < m.sortDelay {
-                m.sortBy = m.pendingSort
-                m.pendingSort = -1 // Reset pending sort
-                // Trigger a refresh with the new sort order
-                return m, getEnhancedNetworkStatsCmd(m.sortBy)
-            } else {
-                // The pending sort is too old, reset it
-                m.pendingSort = -1
-            }
+            m.sortBy = m.pendingSort
+            m.pendingSort = -1 // Reset pending sort
+            // Trigger a refresh with the new sort order
+            return m, getEnhancedNetworkStatsCmd(m.sortBy)
         }
     case tea.WindowSizeMsg:
         m.width = msg.Width
