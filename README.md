@@ -2,7 +2,8 @@
 
 `gonet-top` is a powerful, terminal-based network monitoring tool for Windows, designed to give you a real-time, detailed view of network activity on your system. It provides an at-a-glance summary of which processes are using the network, their connection counts, and their data transfer rates.
 
-![gonet-top screenshot](https://i.imgur.com/your-screenshot.png) <!-- placeholder -->
+![1000139224](https://github.com/user-attachments/assets/dfba8668-3bb9-499b-995b-a4350f7ee5c3)
+<!-- placeholder -->
 
 ## Features
 
