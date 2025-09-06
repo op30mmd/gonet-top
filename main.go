@@ -548,7 +548,7 @@ func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
         if processMap[pid] == nil {
             processMap[pid] = &ProcessNetDetails{
                 PID:         pid,
-                RemoteHosts: make(map[string]uint32]),
+                RemoteHosts: make(map[string]uint32),
                 Connections: make([]NetworkConnection, 0),
             }
         }
