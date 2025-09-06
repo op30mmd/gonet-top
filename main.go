@@ -1156,7 +1156,7 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
             // Estimate system process IO based on uptime and connections
             if !startTime.IsZero() {
                 uptime := now.Sub(startTime)
-                estimatedIO := uint64(uptime.Seconds()) * uint32(totalCount) * 1024 * 10 // 10KB per second per connection
+                estimatedIO := uint64(uptime.Seconds()) * uint64(totalCount) * 1024 * 10 // 10KB per second per connection
                 totalIO = estimatedIO
                 // Also estimate rates for system processes
                 uploadRate = float64(estimatedIO/2) / uptime.Seconds()
