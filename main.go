@@ -124,6 +124,7 @@ type ProcessNetDetails struct {
     UploadRate         float64 // bytes per second
     DownloadRate       float64 // bytes per second
     HasIOData          bool    // Flag to indicate if we successfully got IO data
+    TotalIO            uint64  // Added to track total I/O in the details structure
 }
 
 // --- Admin Check ---
@@ -559,6 +560,7 @@ func (m model) renderDetailedView() string {
         details.WriteString(fmt.Sprintf("Upload Rate: %s/s | Download Rate: %s/s\n", selected.UploadRate, selected.DownloadRate))
         details.WriteString(fmt.Sprintf("Total Bytes Sent: %s | Total Bytes Received: %s\n", 
             selected.TotalBytesSent, selected.TotalBytesReceived))
+        details.WriteString(fmt.Sprintf("Total I/O: %s\n", formatBytes(selected.TotalIO)))
         details.WriteString(fmt.Sprintf("Listen Ports: %s\n", selected.ListenPortsStr))
         if selected.TopRemoteHost != "" {
             details.WriteString(fmt.Sprintf("Top Remote Host: %s (%d connections)\n", selected.TopRemoteHost, selected.TopRemoteHostConns))
@@ -585,8 +587,8 @@ func (m model) renderConnectionsView() string {
     doc.WriteString(titleStyle.Render(fmt.Sprintf("Active Connections for %s (PID %d)", selected.ProcessName, selected.PID)))
     doc.WriteString("\n\n")
     doc.WriteString(fmt.Sprintf("Uptime: %s | Upload: %s/s | Download: %s/s\n", selected.Uptime, selected.UploadRate, selected.DownloadRate))
-    doc.WriteString(fmt.Sprintf("Total Sent: %s | Total Received: %s\n\n", 
-        selected.TotalBytesSent, selected.TotalBytesReceived))
+    doc.WriteString(fmt.Sprintf("Total Sent: %s | Total Received: %s | Total I/O: %s\n\n", 
+        selected.TotalBytesSent, selected.TotalBytesReceived, formatBytes(selected.TotalIO)))
     
     if len(selected.Connections) == 0 {
         doc.WriteString("No active connections found for this process.\n")
@@ -775,6 +777,7 @@ func getTcpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
                 LastRemoteDest: "",
                 LastRemoteTime: time.Time{},
                 ProcessStartTime: time.Time{},
+                TotalIO:      0, // Initialize TotalIO
             }
         }
         processMap[pid].TCPConns++
@@ -854,6 +857,7 @@ func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
                 LastRemoteDest: "",
                 LastRemoteTime: time.Time{},
                 ProcessStartTime: time.Time{},
+                TotalIO:      0, // Initialize TotalIO
             }
         }
         processMap[pid].UDPConns++
@@ -927,7 +931,7 @@ func sortByDownloadRate(a, b ProcessDisplayInfo) bool {
 }
 
 func sortByTotalIO(a, b ProcessDisplayInfo) bool {
-    // If both have IO data, sort by total IO (descending)
+    // If both have IO data, sort by total IO (descending - highest first)
     if a.HasIOData && b.HasIOData {
         return a.TotalIO > b.TotalIO
     }
@@ -1099,6 +1103,7 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         details.UploadRate = uploadRate
         details.DownloadRate = downloadRate
         details.HasIOData = hasIOData
+        details.TotalIO = totalIO // Store TotalIO in the details structure
         
         statsMap.m[pid] = &details
     }
@@ -1242,12 +1247,15 @@ func showDebugStats() {
         // Get I/O counters
         ioCounters, err := getProcessIoCounters(pid)
         var uploadStr, downloadStr string
+        var totalIO uint64
         if err == nil {
             uploadStr = formatBytes(ioCounters.WriteTransferCount)
             downloadStr = formatBytes(ioCounters.ReadTransferCount)
+            totalIO = ioCounters.ReadTransferCount + ioCounters.WriteTransferCount
         } else {
             uploadStr = "N/A"
             downloadStr = "N/A"
+            totalIO = 0
         }
         
         // Get uptime
@@ -1262,7 +1270,7 @@ func showDebugStats() {
         fmt.Printf("PID %d (%s):\n", pid, name)
         fmt.Printf("  TCP=%d, UDP=%d, Established=%d\n", tcpCount, udpCount, establishedCount)
         fmt.Printf("  Uptime: %s\n", uptimeStr)
-        fmt.Printf("  Upload: %s, Download: %s\n", uploadStr, downloadStr)
+        fmt.Printf("  Upload: %s, Download: %s, Total IO: %s\n", uploadStr, downloadStr, formatBytes(totalIO))
         fmt.Printf("  Listen ports: %s\n", formatPorts(listenPorts))
         if topRemote != "" {
             fmt.Printf("  Top remote: %s (%d conns)\n", topRemote, topRemoteCount)
