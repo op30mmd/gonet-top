@@ -373,7 +373,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
                 appSettings.Unlock()
                 return m, nil
             }
-        case "right", "l":  // FIXED: Changed to only handle right arrow
+        case "right", "k":  // FIXED: Changed to only handle right arrow
             if m.showSettings {
                 // In settings mode, adjust sort delay
                 appSettings.Lock()
