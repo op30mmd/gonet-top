@@ -1,6 +1,7 @@
 //go:build windows
 // +build windows
 package main
+
 import (
     "flag"
     "fmt"
@@ -17,6 +18,7 @@ import (
     "github.com/charmbracelet/lipgloss"
     "github.com/mitchellh/go-ps"
 )
+
 // --- Windows API declarations ---
 var (
     kernel32 = syscall.NewLazyDLL("kernel32.dll")
@@ -26,9 +28,11 @@ var (
     procGetUdpTable          = iphlpapi.NewProc("GetUdpTable")
     procGetProcessIoCounters = kernel32.NewProc("GetProcessIoCounters")
 )
+
 // TCP_TABLE_OWNER_PID_ALL constant
 const TCP_TABLE_OWNER_PID_ALL = 5
 const UDP_TABLE_OWNER_PID = 1
+
 // TCP connection states
 var tcpStates = map[uint32]string{
     1:  "CLOSED",
@@ -44,6 +48,7 @@ var tcpStates = map[uint32]string{
     11: "TIME_WAIT",
     12: "DELETE_TCB",
 }
+
 // MIB_TCPROW2 structure
 type MIB_TCPROW2 struct {
     State      uint32
@@ -54,20 +59,24 @@ type MIB_TCPROW2 struct {
     OwningPid  uint32
     OffloadState uint32
 }
+
 type MIB_TCPTABLE2 struct {
     NumEntries uint32
     Table      [1]MIB_TCPROW2
 }
+
 // MIB_UDPROW_OWNER_PID structure
 type MIB_UDPROW_OWNER_PID struct {
     LocalAddr uint32
     LocalPort uint32
     OwningPid uint32
 }
+
 type MIB_UDPTABLE_OWNER_PID struct {
     NumEntries uint32
     Table      [1]MIB_UDPROW_OWNER_PID
 }
+
 // IO_COUNTERS structure for I/O statistics
 type IO_COUNTERS struct {
     ReadOperationCount  uint64
@@ -77,6 +86,7 @@ type IO_COUNTERS struct {
     WriteTransferCount  uint64
     OtherTransferCount  uint64
 }
+
 // --- Enhanced Data Structures ---
 type NetworkConnection struct {
     Protocol    string
@@ -87,6 +97,7 @@ type NetworkConnection struct {
     State       string
     PID         uint32
 }
+
 type ProcessNetDetails struct {
     PID                uint32
     ProcessName        string
@@ -109,19 +120,23 @@ type ProcessNetDetails struct {
     DownloadRate       float64 // bytes per second
     HasIOData          bool    // Flag to indicate if we successfully got IO data
 }
+
 // --- Admin Check ---
 func isAdmin() bool {
     _, err := os.Open("\\\\.\\PHYSICALDRIVE0")
     return err == nil
 }
+
 var statsMap = struct {
     sync.RWMutex
     m map[uint32]*ProcessNetDetails
 }{m: make(map[uint32]*ProcessNetDetails)}
+
 var pidNameCache = struct {
     sync.RWMutex
     m map[uint32]string
 }{m: make(map[uint32]string)}
+
 // --- Enhanced Bubble Tea Model ---
 type ProcessDisplayInfo struct {
     PID                uint32
@@ -143,10 +158,14 @@ type ProcessDisplayInfo struct {
     TotalIO            uint64  // For sorting (total bytes in + out)
     HasIOData          bool    // Flag to indicate if we successfully got IO data
 }
+
 type statsUpdatedMsg struct {
     processes []ProcessDisplayInfo
     sortBy    int
 }
+
+type checkPendingSortMsg struct{}
+
 type model struct {
     processes      []ProcessDisplayInfo
     lastUpdate     time.Time
@@ -160,6 +179,7 @@ type model struct {
     pendingSort    int
     pendingSortTime time.Time
 }
+
 func initialModel() model {
     return model{
         lastUpdate:     time.Now(),
@@ -173,11 +193,13 @@ func initialModel() model {
         pendingSort:    -1, // No pending sort
     }
 }
+
 func (m model) Init() tea.Cmd {
     go startNetworkMonitor()
     go startProcessNameWatcher()
     return tickWithSortAndDelay(m.sortBy, m.refreshDelay)
 }
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     switch msg := msg.(type) {
     case tea.KeyMsg:
@@ -236,9 +258,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             newSort := (m.sortBy + 1) % 6 // Now 6 sort options (0-5)
             m.pendingSort = newSort
             m.pendingSortTime = time.Now()
-            return m, nil
+            // Start a timer to check when to apply the sort
+            return m, tea.Tick(m.sortDelay, func(t time.Time) tea.Msg {
+                return checkPendingSortMsg{}
+            })
         case "r":
             m.showSettings = !m.showSettings
+        }
+    case checkPendingSortMsg:
+        // Check if we should apply the pending sort
+        if m.pendingSort >= 0 {
+            m.sortBy = m.pendingSort
+            m.pendingSort = -1 // Reset pending sort
+            // Trigger a refresh with the new sort order
+            return m, getEnhancedNetworkStatsCmd(m.sortBy)
         }
     case statsUpdatedMsg:
         oldSelected := m.selectedIdx
@@ -256,6 +289,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
     }
     return m, nil
 }
+
 func (m model) View() string {
     var doc strings.Builder
     
@@ -264,17 +298,10 @@ func (m model) View() string {
     doc.WriteString(fmt.Sprintf("Last updated: %s | Active processes: %d | Selected: %d\n\n", 
         m.lastUpdate.Format("15:04:05"), len(m.processes), m.selectedIdx+1))
     
-    // Check if we have a pending sort
+    // Show pending sort indicator if there's a pending sort
     if m.pendingSort >= 0 {
         timeSincePending := time.Since(m.pendingSortTime)
-        if timeSincePending >= m.sortDelay {
-            // Apply the pending sort
-            m.sortBy = m.pendingSort
-            m.pendingSort = -1 // Reset pending sort
-            // Return a command to refresh with the new sort
-            return doc.String()
-        } else {
-            // Show pending sort indicator
+        if timeSincePending < m.sortDelay {
             remainingTime := m.sortDelay - timeSincePending
             doc.WriteString(fmt.Sprintf("Sorting in %.1fs... (Press 's' to cancel)\n\n", remainingTime.Seconds()))
         }
@@ -305,82 +332,7 @@ func (m model) View() string {
         return doc.String() + m.renderSummaryView()
     }
 }
-func (m model) renderPendingSortView() string {
-    var doc strings.Builder
-    
-    headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
-    cellStyle := lipgloss.NewStyle().Padding(0, 1)
-    selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
-    headers := []string{"PID", "Process Name", "TCP", "UDP", "Total", "Upload", "Download"}
-    headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
-        headerStyle.Copy().Width(8).Render(headers[0]),
-        headerStyle.Copy().Width(16).Render(headers[1]),
-        headerStyle.Copy().Width(6).Render(headers[2]),
-        headerStyle.Copy().Width(6).Render(headers[3]),
-        headerStyle.Copy().Width(6).Render(headers[4]),
-        headerStyle.Copy().Width(10).Render(headers[5]),
-        headerStyle.Copy().Width(10).Render(headers[6]),
-    )
-    doc.WriteString(headerRow + "\n")
-    
-    // Sort the processes with the new sort method
-    sortedProcesses := make([]ProcessDisplayInfo, len(m.processes))
-    copy(sortedProcesses, m.processes)
-    
-    switch m.pendingSort {
-    case 1: // Sort by upload rate
-        sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortByUploadRate(sortedProcesses[i], sortedProcesses[j])
-        })
-    case 2: // Sort by download rate
-        sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortByDownloadRate(sortedProcesses[i], sortedProcesses[j])
-        })
-    case 3: // Sort by process name
-        sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortedProcesses[i].ProcessName < sortedProcesses[j].ProcessName
-        })
-    case 4: // Sort by PID
-        sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortedProcesses[i].PID < sortedProcesses[j].PID
-        })
-    case 5: // Sort by total IO
-        sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortByTotalIO(sortedProcesses[i], sortedProcesses[j])
-        })
-    default: // Sort by total connections
-        sort.Slice(sortedProcesses, func(i, j int) bool {
-            return sortedProcesses[i].TotalConns > sortedProcesses[j].TotalConns
-        })
-    }
-    
-    for i, p := range sortedProcesses {
-        style := cellStyle
-        if i == m.selectedIdx {
-            style = selectedStyle
-        }
-        row := lipgloss.JoinHorizontal(lipgloss.Left,
-            style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
-            style.Copy().Width(16).Render(truncateString(p.ProcessName, 14)),
-            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TCPConns)),
-            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.UDPConns)),
-            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TotalConns)),
-            style.Copy().Width(10).Render(p.UploadRate),
-            style.Copy().Width(10).Render(p.DownloadRate),
-        )
-        doc.WriteString(row + "\n")
-    }
-    
-    // Show the rest of the controls
-    if m.showSettings {
-        doc.WriteString("\nSettings Mode - Refresh: ↑/↓=adjust, Sort Delay: ←/→=adjust, Enter=exit\n\n")
-        doc.WriteString(fmt.Sprintf("Current refresh delay: %v | Current sort delay: %v\n", m.refreshDelay, m.sortDelay))
-    } else {
-        doc.WriteString("\nControls: ↑/↓=navigate, Enter/d=details, Tab=view mode, s=sort, r=settings, q=quit\n\n")
-    }
-    
-    return doc.String()
-}
+
 func (m model) getViewModeName() string {
     switch m.viewMode {
     case 0:
@@ -393,6 +345,7 @@ func (m model) getViewModeName() string {
         return "Unknown"
     }
 }
+
 func (m model) getSortModeName() string {
     if m.pendingSort >= 0 {
         switch m.pendingSort {
@@ -430,6 +383,7 @@ func (m model) getSortModeName() string {
         return "Unknown"
     }
 }
+
 func (m model) renderSummaryView() string {
     var doc strings.Builder
     
@@ -465,6 +419,7 @@ func (m model) renderSummaryView() string {
     }
     return doc.String()
 }
+
 func (m model) renderDetailedView() string {
     var doc strings.Builder
     
@@ -520,6 +475,7 @@ func (m model) renderDetailedView() string {
     }
     return doc.String()
 }
+
 func (m model) renderConnectionsView() string {
     var doc strings.Builder
     
@@ -566,12 +522,14 @@ func (m model) renderConnectionsView() string {
     }
     return doc.String()
 }
+
 func truncateString(s string, maxLen int) string {
     if len(s) <= maxLen {
         return s
     }
     return s[:maxLen-3] + "..."
 }
+
 // Format bytes to human-readable string
 func formatBytes(bytes uint64) string {
     const unit = 1024
@@ -585,6 +543,7 @@ func formatBytes(bytes uint64) string {
     }
     return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
+
 // Format bytes per second to human-readable string
 func formatBytesPerSecond(bytesPerSec float64) string {
     if bytesPerSec < 1024 {
@@ -597,12 +556,14 @@ func formatBytesPerSecond(bytesPerSec float64) string {
         return fmt.Sprintf("%.1f G", bytesPerSec/(1024*1024*1024))
     }
 }
+
 // --- Ticker with sort and delay parameters ---
 func tickWithSortAndDelay(sortBy int, delay time.Duration) tea.Cmd {
     return tea.Tick(delay, func(t time.Time) tea.Msg {
         return getEnhancedNetworkStats(sortBy)
     })
 }
+
 // --- Get Process I/O Counters ---
 func getProcessIoCounters(pid uint32) (IO_COUNTERS, error) {
     var ioCounters IO_COUNTERS
@@ -622,6 +583,7 @@ func getProcessIoCounters(pid uint32) (IO_COUNTERS, error) {
     
     return ioCounters, nil
 }
+
 // --- Enhanced Network Connection Monitoring ---
 func getTcpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, error) {
     processMap := make(map[uint32]*ProcessNetDetails)
@@ -692,6 +654,7 @@ func getTcpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
     }
     return processMap, allConnections, nil
 }
+
 func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, error) {
     processMap := make(map[uint32]*ProcessNetDetails)
     var allConnections []NetworkConnection
@@ -746,6 +709,7 @@ func getUdpConnections() (map[uint32]*ProcessNetDetails, []NetworkConnection, er
     }
     return processMap, allConnections, nil
 }
+
 func ipFromUint32(addr uint32) string {
     return fmt.Sprintf("%d.%d.%d.%d",
         addr&0xFF,
@@ -753,9 +717,11 @@ func ipFromUint32(addr uint32) string {
         (addr>>16)&0xFF,
         (addr>>24)&0xFF)
 }
+
 func portFromUint32(port uint32) uint16 {
     return uint16((port&0xFF)<<8 | (port>>8)&0xFF)
 }
+
 // Helper functions for sorting with N/A values
 func sortByUploadRate(a, b ProcessDisplayInfo) bool {
     // If both have IO data, sort by upload rate
@@ -983,6 +949,13 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
         sortBy:    sortBy,
     }
 }
+
+func getEnhancedNetworkStatsCmd(sortBy int) tea.Cmd {
+    return func() tea.Msg {
+        return getEnhancedNetworkStats(sortBy)
+    }
+}
+
 func formatPorts(ports []uint16) string {
     if len(ports) == 0 {
         return "-"
@@ -1011,6 +984,7 @@ func formatPorts(ports []uint16) string {
     }
     return strings.Join(portStrs, ",")
 }
+
 // --- Debug Functions ---
 func showDebugStats() {
     tcpProcessMap, _, err := getTcpConnections()
@@ -1088,6 +1062,7 @@ func showDebugStats() {
     }
     fmt.Println("=====================================")
 }
+
 // --- Process Name Discovery ---
 func getProcessNames() (map[uint32]string, error) {
     processes, err := ps.Processes()
@@ -1100,6 +1075,7 @@ func getProcessNames() (map[uint32]string, error) {
     }
     return pidMap, nil
 }
+
 func startProcessNameWatcher() {
     update := func() {
         names, err := getProcessNames()
@@ -1120,6 +1096,7 @@ func startProcessNameWatcher() {
         update()
     }
 }
+
 func startNetworkMonitor() {
     log.Println("Starting enhanced network connection monitor...")
     ticker := time.NewTicker(2 * time.Second)
@@ -1130,6 +1107,7 @@ func startNetworkMonitor() {
         // which is called by the tick() function
     }
 }
+
 // --- Main ---
 func main() {
     // Command line flags
