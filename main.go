@@ -190,6 +190,8 @@ type model struct {
     showSettings   bool
     pendingSort    int
     pendingSortTime time.Time
+    width          int // Terminal width
+    height         int // Terminal height
 }
 
 func initialModel() model {
@@ -203,6 +205,8 @@ func initialModel() model {
         sortDelay:      500 * time.Millisecond, // 500ms delay for sorting
         showSettings:   false,
         pendingSort:    -1, // No pending sort
+        width:          80,  // Default width
+        height:         24,  // Default height
     }
 }
 
@@ -286,6 +290,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
             // Trigger a refresh with the new sort order
             return m, getEnhancedNetworkStatsCmd(m.sortBy)
         }
+    case tea.WindowSizeMsg:
+        m.width = msg.Width
+        m.height = msg.Height
     case statsUpdatedMsg:
         oldSelected := m.selectedIdx
         m.processes = msg.processes
@@ -400,22 +407,44 @@ func (m model) getSortModeName() string {
 func (m model) renderSummaryView() string {
     var doc strings.Builder
     
+    // Calculate column widths based on available space
+    availableWidth := m.width - 2 // Account for borders
+    if availableWidth < 60 {
+        availableWidth = 60 // Minimum width
+    }
+    
+    // Fixed width columns
+    pidWidth := 8
+    tcpWidth := 6
+    udpWidth := 6
+    totalWidth := 6
+    uptimeWidth := 10
+    uploadWidth := 8
+    downloadWidth := 8
+    
+    // Remaining width for process name and last destination
+    remainingWidth := availableWidth - (pidWidth + tcpWidth + udpWidth + totalWidth + uptimeWidth + uploadWidth + downloadWidth)
+    processNameWidth := remainingWidth / 2
+    lastDestWidth := remainingWidth - processNameWidth
+    
     headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
     cellStyle := lipgloss.NewStyle().Padding(0, 1)
     selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
+    
     headers := []string{"PID", "Process Name", "TCP", "UDP", "Total", "Uptime", "Upload", "Download", "Last Destination"}
     headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
-        headerStyle.Copy().Width(8).Render(headers[0]),
-        headerStyle.Copy().Width(12).Render(headers[1]),
-        headerStyle.Copy().Width(6).Render(headers[2]),
-        headerStyle.Copy().Width(6).Render(headers[3]),
-        headerStyle.Copy().Width(6).Render(headers[4]),
-        headerStyle.Copy().Width(10).Render(headers[5]),
-        headerStyle.Copy().Width(8).Render(headers[6]),
-        headerStyle.Copy().Width(8).Render(headers[7]),
-        headerStyle.Copy().Width(16).Render(headers[8]),
+        headerStyle.Copy().Width(pidWidth).Render(headers[0]),
+        headerStyle.Copy().Width(processNameWidth).Render(headers[1]),
+        headerStyle.Copy().Width(tcpWidth).Render(headers[2]),
+        headerStyle.Copy().Width(udpWidth).Render(headers[3]),
+        headerStyle.Copy().Width(totalWidth).Render(headers[4]),
+        headerStyle.Copy().Width(uptimeWidth).Render(headers[5]),
+        headerStyle.Copy().Width(uploadWidth).Render(headers[6]),
+        headerStyle.Copy().Width(downloadWidth).Render(headers[7]),
+        headerStyle.Copy().Width(lastDestWidth).Render(headers[8]),
     )
     doc.WriteString(headerRow + "\n")
+    
     for i, p := range m.processes {
         style := cellStyle
         if i == m.selectedIdx {
@@ -427,15 +456,15 @@ func (m model) renderSummaryView() string {
             lastDest = "-"
         }
         row := lipgloss.JoinHorizontal(lipgloss.Left,
-            style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
-            style.Copy().Width(12).Render(truncateString(p.ProcessName, 10)),
-            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TCPConns)),
-            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.UDPConns)),
-            style.Copy().Width(6).Render(fmt.Sprintf("%d", p.TotalConns)),
-            style.Copy().Width(10).Render(p.Uptime),
-            style.Copy().Width(8).Render(p.UploadRate),
-            style.Copy().Width(8).Render(p.DownloadRate),
-            style.Copy().Width(16).Render(truncateString(lastDest, 14)),
+            style.Copy().Width(pidWidth).Render(fmt.Sprintf("%d", p.PID)),
+            style.Copy().Width(processNameWidth).Render(truncateString(p.ProcessName, processNameWidth-3)),
+            style.Copy().Width(tcpWidth).Render(fmt.Sprintf("%d", p.TCPConns)),
+            style.Copy().Width(udpWidth).Render(fmt.Sprintf("%d", p.UDPConns)),
+            style.Copy().Width(totalWidth).Render(fmt.Sprintf("%d", p.TotalConns)),
+            style.Copy().Width(uptimeWidth).Render(p.Uptime),
+            style.Copy().Width(uploadWidth).Render(p.UploadRate),
+            style.Copy().Width(downloadWidth).Render(p.DownloadRate),
+            style.Copy().Width(lastDestWidth).Render(truncateString(lastDest, lastDestWidth-3)),
         )
         doc.WriteString(row + "\n")
     }
@@ -445,22 +474,44 @@ func (m model) renderSummaryView() string {
 func (m model) renderDetailedView() string {
     var doc strings.Builder
     
+    // Calculate column widths based on available space
+    availableWidth := m.width - 2 // Account for borders
+    if availableWidth < 60 {
+        availableWidth = 60 // Minimum width
+    }
+    
+    // Fixed width columns
+    pidWidth := 8
+    tcpWidth := 5
+    udpWidth := 5
+    estWidth := 5
+    uptimeWidth := 8
+    uploadWidth := 8
+    downloadWidth := 8
+    
+    // Remaining width for process name and last destination
+    remainingWidth := availableWidth - (pidWidth + tcpWidth + udpWidth + estWidth + uptimeWidth + uploadWidth + downloadWidth)
+    processNameWidth := remainingWidth / 2
+    lastDestWidth := remainingWidth - processNameWidth
+    
     headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
     cellStyle := lipgloss.NewStyle().Padding(0, 1)
     selectedStyle := lipgloss.NewStyle().Background(lipgloss.Color("240")).Foreground(lipgloss.Color("15")).Padding(0, 1)
+    
     headers := []string{"PID", "Process", "TCP", "UDP", "EST", "Uptime", "Up/s", "Down/s", "Last Dest"}
     headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
-        headerStyle.Copy().Width(8).Render(headers[0]),
-        headerStyle.Copy().Width(8).Render(headers[1]),
-        headerStyle.Copy().Width(5).Render(headers[2]),
-        headerStyle.Copy().Width(5).Render(headers[3]),
-        headerStyle.Copy().Width(5).Render(headers[4]),
-        headerStyle.Copy().Width(8).Render(headers[5]),
-        headerStyle.Copy().Width(8).Render(headers[6]),
-        headerStyle.Copy().Width(8).Render(headers[7]),
-        headerStyle.Copy().Width(14).Render(headers[8]),
+        headerStyle.Copy().Width(pidWidth).Render(headers[0]),
+        headerStyle.Copy().Width(processNameWidth).Render(headers[1]),
+        headerStyle.Copy().Width(tcpWidth).Render(headers[2]),
+        headerStyle.Copy().Width(udpWidth).Render(headers[3]),
+        headerStyle.Copy().Width(estWidth).Render(headers[4]),
+        headerStyle.Copy().Width(uptimeWidth).Render(headers[5]),
+        headerStyle.Copy().Width(uploadWidth).Render(headers[6]),
+        headerStyle.Copy().Width(downloadWidth).Render(headers[7]),
+        headerStyle.Copy().Width(lastDestWidth).Render(headers[8]),
     )
     doc.WriteString(headerRow + "\n")
+    
     for i, p := range m.processes {
         style := cellStyle
         if i == m.selectedIdx {
@@ -472,18 +523,19 @@ func (m model) renderDetailedView() string {
             lastDest = "-"
         }
         row := lipgloss.JoinHorizontal(lipgloss.Left,
-            style.Copy().Width(8).Render(fmt.Sprintf("%d", p.PID)),
-            style.Copy().Width(8).Render(truncateString(p.ProcessName, 6)),
-            style.Copy().Width(5).Render(fmt.Sprintf("%d", p.TCPConns)),
-            style.Copy().Width(5).Render(fmt.Sprintf("%d", p.UDPConns)),
-            style.Copy().Width(5).Render(fmt.Sprintf("%d", p.EstablishedConns)),
-            style.Copy().Width(8).Render(p.Uptime),
-            style.Copy().Width(8).Render(p.UploadRate),
-            style.Copy().Width(8).Render(p.DownloadRate),
-            style.Copy().Width(14).Render(truncateString(lastDest, 12)),
+            style.Copy().Width(pidWidth).Render(fmt.Sprintf("%d", p.PID)),
+            style.Copy().Width(processNameWidth).Render(truncateString(p.ProcessName, processNameWidth-3)),
+            style.Copy().Width(tcpWidth).Render(fmt.Sprintf("%d", p.TCPConns)),
+            style.Copy().Width(udpWidth).Render(fmt.Sprintf("%d", p.UDPConns)),
+            style.Copy().Width(estWidth).Render(fmt.Sprintf("%d", p.EstablishedConns)),
+            style.Copy().Width(uptimeWidth).Render(p.Uptime),
+            style.Copy().Width(uploadWidth).Render(p.UploadRate),
+            style.Copy().Width(downloadWidth).Render(p.DownloadRate),
+            style.Copy().Width(lastDestWidth).Render(truncateString(lastDest, lastDestWidth-3)),
         )
         doc.WriteString(row + "\n")
     }
+    
     // Show details for selected process
     if m.showDetails && m.selectedIdx < len(m.processes) {
         selected := m.processes[m.selectedIdx]
@@ -524,23 +576,40 @@ func (m model) renderConnectionsView() string {
     doc.WriteString(titleStyle.Render(fmt.Sprintf("Active Connections for %s (PID %d)", selected.ProcessName, selected.PID)))
     doc.WriteString("\n\n")
     doc.WriteString(fmt.Sprintf("Uptime: %s | Upload: %s/s | Download: %s/s\n", selected.Uptime, selected.UploadRate, selected.DownloadRate))
-    doc.WriteString(fmt.Sprintf("Total Sent: %s | Total Received: %s\n", 
+    doc.WriteString(fmt.Sprintf("Total Sent: %s | Total Received: %s\n\n", 
         selected.TotalBytesSent, selected.TotalBytesReceived))
     
     if len(selected.Connections) == 0 {
         doc.WriteString("No active connections found for this process.\n")
         return doc.String()
     }
+    
+    // Calculate column widths based on available space
+    availableWidth := m.width - 2 // Account for borders
+    if availableWidth < 60 {
+        availableWidth = 60 // Minimum width
+    }
+    
+    // Fixed width columns
+    protocolWidth := 8
+    stateWidth := 12
+    
+    // Remaining width for addresses
+    remainingWidth := availableWidth - (protocolWidth + stateWidth)
+    addrWidth := remainingWidth / 2
+    
     headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
     cellStyle := lipgloss.NewStyle().Padding(0, 1)
+    
     headers := []string{"Protocol", "Local Address", "Remote Address", "State"}
     headerRow := lipgloss.JoinHorizontal(lipgloss.Left,
-        headerStyle.Copy().Width(8).Render(headers[0]),
-        headerStyle.Copy().Width(22).Render(headers[1]),
-        headerStyle.Copy().Width(22).Render(headers[2]),
-        headerStyle.Copy().Width(12).Render(headers[3]),
+        headerStyle.Copy().Width(protocolWidth).Render(headers[0]),
+        headerStyle.Copy().Width(addrWidth).Render(headers[1]),
+        headerStyle.Copy().Width(addrWidth).Render(headers[2]),
+        headerStyle.Copy().Width(stateWidth).Render(headers[3]),
     )
     doc.WriteString(headerRow + "\n")
+    
     for _, conn := range selected.Connections {
         localAddr := fmt.Sprintf("%s:%d", conn.LocalAddr, conn.LocalPort)
         remoteAddr := fmt.Sprintf("%s:%d", conn.RemoteAddr, conn.RemotePort)
@@ -548,10 +617,10 @@ func (m model) renderConnectionsView() string {
             remoteAddr = "*:*"
         }
         row := lipgloss.JoinHorizontal(lipgloss.Left,
-            cellStyle.Copy().Width(8).Render(conn.Protocol),
-            cellStyle.Copy().Width(22).Render(truncateString(localAddr, 20)),
-            cellStyle.Copy().Width(22).Render(truncateString(remoteAddr, 20)),
-            cellStyle.Copy().Width(12).Render(conn.State),
+            cellStyle.Copy().Width(protocolWidth).Render(conn.Protocol),
+            cellStyle.Copy().Width(addrWidth).Render(truncateString(localAddr, addrWidth-3)),
+            cellStyle.Copy().Width(addrWidth).Render(truncateString(remoteAddr, addrWidth-3)),
+            cellStyle.Copy().Width(stateWidth).Render(conn.State),
         )
         doc.WriteString(row + "\n")
     }
@@ -1346,6 +1415,7 @@ func main() {
         fmt.Println("- Shows 'N/A' for data that cannot be accessed due to permissions")
         fmt.Println("- Shows last destination IP for each process")
         fmt.Println("- Shows process uptime for each process")
+        fmt.Println("- Uses all available terminal space")
         fmt.Println("- Press 'r' to adjust refresh and sort delay settings")
         fmt.Println("- Use Tab to switch between views, Arrow keys to navigate")
         fmt.Println("- Press Enter or 'd' to toggle process details")
