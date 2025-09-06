@@ -1140,6 +1140,9 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
                 uptime := now.Sub(startTime)
                 estimatedIO := uint64(uptime.Seconds()) * uint64(totalCount) * 1024 * 10 // 10KB per second per connection
                 totalIO = estimatedIO
+                // Also estimate rates for system processes
+                uploadRate = float64(estimatedIO/2) / uptime.Seconds()
+                downloadRate = float64(estimatedIO/2) / uptime.Seconds()
                 hasIOData = true
             }
         }
@@ -1152,9 +1155,9 @@ func getEnhancedNetworkStats(sortBy int) statsUpdatedMsg {
             totalBytesSentStr = formatBytes(ioCounters.WriteTransferCount)
             totalBytesReceivedStr = formatBytes(ioCounters.ReadTransferCount)
         } else if hasIOData && details.IsSystemProcess {
-            // For system processes, show estimated values
-            uploadRateStr = "Est."
-            downloadRateStr = "Est."
+            // For system processes, show estimated values with proper rate calculation
+            uploadRateStr = formatBytesPerSecond(uploadRate)
+            downloadRateStr = formatBytesPerSecond(downloadRate)
             totalBytesSentStr = formatBytes(totalIO / 2)
             totalBytesReceivedStr = formatBytes(totalIO / 2)
         } else {
